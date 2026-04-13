@@ -1,9 +1,9 @@
 <img src="icons/icon.png" width="300" alt="SIPGO">
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/emiago/sipgo)](https://goreportcard.com/report/github.com/emiago/sipgo)
-![Used By](https://sourcegraph.com/github.com/emiago/sipgo/-/badge.svg)
+[![Go Report Card](https://goreportcard.com/badge/github.com/hujm2023/sipgo)](https://goreportcard.com/report/github.com/hujm2023/sipgo)
+![Used By](https://sourcegraph.com/github.com/hujm2023/sipgo/-/badge.svg)
 ![Coverage](https://img.shields.io/badge/coverage-55.4%25-blue)
-[![License](https://img.shields.io/badge/License-BSD_2--Clause-orange.svg)](https://github.com/emiago/sipgo/LICENCE) 
+[![License](https://img.shields.io/badge/License-BSD_2--Clause-orange.svg)](https://github.com/hujm2023/sipgo/LICENCE) 
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/emiago/sipgo)
 
 **SIPGO** is library for writing fast SIP services in GO language.  
@@ -16,14 +16,14 @@ It comes with [SIP stack](/sip/README.md) ([RFC 3261](https://datatracker.ietf.o
 
 Fetch lib with:
 
-`go get github.com/emiago/sipgo`
+`go get github.com/hujm2023/sipgo`
 
 
 If you like/use project currently and looking for support/sponsoring  checkout [Support section](#support)  
 
 You can follow on [X/Twitter](https://twitter.com/emiago123) for more updates.
 
-More on documentation you can find on [Go doc](https://pkg.go.dev/github.com/emiago/sipgo)
+More on documentation you can find on [Go doc](https://pkg.go.dev/github.com/hujm2023/sipgo)
 
 ## Supported protocols
 
@@ -40,7 +40,7 @@ More on documentation you can find on [Go doc](https://pkg.go.dev/github.com/emi
 - [RFC3581](https://datatracker.ietf.org/doc/html/rfc3581)
 - [RFC6026](https://datatracker.ietf.org/doc/html/rfc6026)
 
-State of Torture Tests [RFC4475](https://datatracker.ietf.org/doc/html/rfc6026) you can find on issue [github.com/emiago/sipgo/issues/57](https://github.com/emiago/sipgo/issues/57)
+State of Torture Tests [RFC4475](https://datatracker.ietf.org/doc/html/rfc6026) you can find on issue [github.com/hujm2023/sipgo/issues/57](https://github.com/hujm2023/sipgo/issues/57)
 but NOTE: some strict validation things may 
 be seperated from parsing or not built into library.
 
@@ -225,7 +225,7 @@ select {
 ```
 
 #### CSEQ Header increase rule: 
-1. Every new transaction will have **implicitely** CSEQ increase if present -> [Issue 160](https://github.com/emiago/sipgo/issues/160). This fixes problem when you are passing same request like ex. REGISTER
+1. Every new transaction will have **implicitely** CSEQ increase if present -> [Issue 160](https://github.com/hujm2023/sipgo/issues/160). This fixes problem when you are passing same request like ex. REGISTER
 2. Above rule does not apply for In Dialog cases
 2. To avoid 1. pass option `client.TransactionRequest(ctx, req, sipgo.ClientRequestBuild)` or more better used `DialogClient`
 
@@ -376,7 +376,7 @@ Content-Length:  0
 If you find this project interesting for bigger support or consulting, you can contact me on
 [mail](mailto:emirfreelance91@gmail.com)
 
-For bugs features pls create [issue](https://github.com/emiago/sipgo/issues).
+For bugs features pls create [issue](https://github.com/hujm2023/sipgo/issues).
 
 ## Extra
 
@@ -384,7 +384,7 @@ For bugs features pls create [issue](https://github.com/emiago/sipgo/issues).
 ### E2E/integration testing
 
 If you are interested using lib for your testing services then checkout 
-[article on how easy you can make calls and other](https://github.com/emiago/sipgo/wiki/E2E-testing)
+[article on how easy you can make calls and other](https://github.com/hujm2023/sipgo/wiki/E2E-testing)
 
 
 ### Tests

@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/emiago/sipgo/fakes"
+	"github.com/hujm2023/sipgo/fakes"
 )
 
 func TestConnectionPool(t *testing.T) {
