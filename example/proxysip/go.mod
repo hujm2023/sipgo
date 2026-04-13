@@ -1,14 +1,14 @@
-module github.com/emiago/sipgo/example/proxysip
+module github.com/hujm2023/sipgo/example/proxysip
 
 go 1.23.0
 
 toolchain go1.23.1
 
-replace github.com/emiago/sipgo => ../../
+replace github.com/hujm2023/sipgo => ../../
 
 require (
 	github.com/arl/statsviz v0.6.0
-	github.com/emiago/sipgo v0.23.1-0.20240913054121-597f4c4406dd
+	github.com/hujm2023/sipgo v0.23.1-0.20240913054121-597f4c4406dd
 	github.com/prometheus/client_golang v1.17.0
 	github.com/rs/zerolog v1.33.0
 	github.com/samber/slog-zerolog/v2 v2.7.3
