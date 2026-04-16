@@ -464,7 +464,7 @@ func (l *TransportLayer) serverRequestConnection(ctx context.Context, req *Reque
 
 	// TODO: refactor bellow to remove duplicate code
 
-	viaHost, viaPort := req.sourceViaHostPort()
+	viaHost, viaPort := responseTargetFromVia(req.Transport(), viaHop)
 	if sourceAddr != "" {
 		// https://datatracker.ietf.org/doc/html/rfc3263#section-5
 		// 		for unreliable transport protocols, to the source
@@ -482,10 +482,15 @@ func (l *TransportLayer) serverRequestConnection(ctx context.Context, req *Reque
 			Hostname: sourceHost,
 		}
 
-		// https://datatracker.ietf.org/doc/html/rfc3581#section-4
-		// If rport is set then we must use sourcePort instead
-		if viaHop != nil && viaHop.Params != nil {
-			if rport, ok := viaHop.Params.Get("rport"); ok && rport == "" {
+		// RFC 3261 §18.2.2:
+		// - if maddr is present, responses target maddr:sent-by-port
+		// - otherwise, unreliable transports use source IP + Via port
+		// RFC 3581 §4 then upgrades the port to sourcePort when empty rport is present.
+		if viaHop.Params != nil {
+			if maddr, ok := viaHop.Params.Get("maddr"); ok && maddr != "" {
+				raddr.IP = net.ParseIP(maddr)
+				raddr.Hostname = maddr
+			} else if rport, ok := viaHop.Params.Get("rport"); ok && rport == "" {
 				raddr.Port = sourcePort
 			}
 		}

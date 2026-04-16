@@ -166,30 +166,44 @@ func (res *Response) Destination() string {
 		return ""
 	}
 
-	var (
-		host string
-		port int
-	)
+	host, port := responseTargetFromVia(res.Transport(), viaHop)
 
+	return fmt.Sprintf("%v:%v", host, port)
+}
+
+// responseTargetFromVia resolves the response destination from the topmost Via.
+//
+// Why this exists:
+// RFC 3261 §18.2.2 gives different precedence rules for unreliable transports:
+// `maddr` must win over NAT-oriented `received` / `rport` handling. Keeping the
+// selection in one place avoids drifting behavior between Destination() and the
+// transport-layer connection lookup.
+func responseTargetFromVia(transport string, viaHop *ViaHeader) (host string, port int) {
 	host = viaHop.Host
 	if viaHop.Port > 0 {
 		port = viaHop.Port
 	} else {
-		port = int(DefaultPort(res.Transport()))
+		port = int(DefaultPort(transport))
 	}
 
-	if viaHop.Params != nil {
-		if received, ok := viaHop.Params.Get("received"); ok && received != "" {
-			host = received
-		}
-		if rport, ok := viaHop.Params.Get("rport"); ok && rport != "" {
-			if p, err := strconv.Atoi(rport); err == nil {
-				port = p
-			}
+	if viaHop.Params == nil {
+		return host, port
+	}
+
+	if maddr, ok := viaHop.Params.Get("maddr"); ok && maddr != "" {
+		return maddr, port
+	}
+
+	if received, ok := viaHop.Params.Get("received"); ok && received != "" {
+		host = received
+	}
+	if rport, ok := viaHop.Params.Get("rport"); ok && rport != "" {
+		if p, err := strconv.Atoi(rport); err == nil {
+			port = p
 		}
 	}
 
-	return fmt.Sprintf("%v:%v", host, port)
+	return host, port
 }
 
 // RFC 3261 - 8.2.6
