@@ -187,16 +187,16 @@ func (p *ParserStream) parseSingle() error {
 			// messages are sent over stream-oriented transports.
 			return ErrParseReadBodyIncomplete
 		}
-		contentLength := int(*p.contentLength)
+		contentLength := *p.contentLength
 		if contentLength == 0 {
 			p.state = -1
 			return nil
 		}
-		// avoid huge allocation if it will exceed message size
-		if (p.totalRead + contentLength) > p.p.MaxMessageLength {
+		if p.p.MaxMessageLength < 0 || p.totalRead > p.p.MaxMessageLength ||
+			uint64(contentLength) > uint64(p.p.MaxMessageLength-p.totalRead) {
 			return ErrMessageTooLarge
 		}
-		body := make([]byte, contentLength)
+		body := make([]byte, int(contentLength))
 		p.msg.SetBody(body)
 		p.state = stateContent
 		fallthrough
