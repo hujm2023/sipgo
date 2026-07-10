@@ -24,9 +24,10 @@ var (
 
 // WS transport implementation
 type TransportWS struct {
-	parser    *Parser
-	log       *slog.Logger
-	transport string
+	parser     *Parser
+	log        *slog.Logger
+	transport  string
+	readFilter TransportReadFilter
 
 	connectionReuse bool
 
@@ -34,6 +35,10 @@ type TransportWS struct {
 	dialer ws.Dialer
 
 	DialerCreate func(laddr net.Addr) ws.Dialer
+
+	// DialURI sets default path to use for connecting
+	// Experimental
+	DialURI func(host string) string
 
 	onConnClose func(conn Connection)
 }
@@ -61,6 +66,10 @@ func (t *TransportWS) init(par *Parser) {
 
 	if t.DialerCreate == nil {
 		t.DialerCreate = t.dialerCreate
+	}
+
+	if t.DialURI == nil {
+		t.DialURI = func(addr string) string { return "ws://" + addr }
 	}
 }
 
@@ -206,6 +215,22 @@ func (t *TransportWS) readConnection(conn *WSConnection, laddr string, raddr str
 			continue
 		}
 
+		if t.readFilter != nil {
+			filtered, err := t.readFilter(TransportReadProps{
+				Transport:  t.Network(),
+				LocalAddr:  conn.LocalAddr(),
+				RemoteAddr: conn.RemoteAddr(),
+			}, data)
+			if err != nil {
+				t.log.Error("Read filter error", "laddr", laddr, "raddr", raddr, "error", err)
+				return
+			}
+			if len(filtered) == 0 {
+				continue
+			}
+			data = filtered
+		}
+
 		// Check is keep alive
 		if len(data) <= 4 {
 			//One or 2 CRLF
@@ -260,13 +285,13 @@ func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Ad
 		addr := traddr.String()
 		log.Debug("Dialing new connection", "raddr", addr)
 
-		dialer := t.dialerCreate(tladdr)
+		dialer := t.DialerCreate(tladdr)
 		// How to define local interface
 		if tladdr != nil {
 			log.Debug("Dialing with local IP is not supported on ws", "laddr", tladdr.String())
 		}
 
-		conn, _, _, err := dialer.Dial(ctx, "ws://"+addr)
+		conn, _, _, err := dialer.Dial(ctx, t.DialURI(addr))
 		if err != nil {
 			return nil, fmt.Errorf("%s dial err=%w", t, err)
 		}

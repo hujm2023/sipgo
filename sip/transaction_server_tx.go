@@ -262,5 +262,13 @@ func (tx *ServerTx) delete(err error) bool {
 	if onterm != nil {
 		onterm(key, err)
 	}
+
+	// Release the connection reference taken at creation, same as ClientTx.delete.
+	// nil-checked because some tests construct a tx with a nil conn.
+	if tx.conn != nil {
+		if _, err := tx.conn.TryClose(); err != nil {
+			tx.log.Info("Closing connection returned error", "error", err, "tx", key)
+		}
+	}
 	return true
 }

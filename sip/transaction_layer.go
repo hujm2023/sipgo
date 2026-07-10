@@ -162,6 +162,7 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 		// For now we only match INVITE
 		key, err := makeServerTxKey(req, INVITE)
 		if err != nil {
+			txl.rejectMalformedRequest(req, err)
 			return fmt.Errorf("make key failed: %w", err)
 		}
 
@@ -186,10 +187,42 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 
 	key, err := makeServerTxKey(req, "")
 	if err != nil {
+		txl.rejectMalformedRequest(req, err)
 		return fmt.Errorf("make key failed: %w", err)
 	}
 
 	return txl.serverTxRequest(req, key)
+}
+
+// rejectMalformedRequest sends a stateless 400 Bad Request response when a
+// request is too malformed to create a transaction (e.g. missing CSeq or Via).
+//
+// Per RFC 3261 Section 8.2:
+//
+//	If a UAS does not understand a header field in a request (that is,
+//	the header field is not defined in this specification or in any
+//	installed extensions), the server MUST ignore that header field and
+//	continue processing the message.
+//
+// And Section 16.3 (Request Validation):
+//
+//	If the request contains a malformed header field that the proxy
+//	requires, the proxy SHOULD return a 400 (Bad Request) response.
+//
+// Without this, the sender retransmits indefinitely because it never
+// receives any response.
+func (txl *TransactionLayer) rejectMalformedRequest(req *Request, reason error) {
+	// Build a minimal 400 response from whatever headers the request has.
+	// NewResponseFromRequest safely skips nil CSeq, From, To, Call-ID.
+	res := NewResponseFromRequest(req, StatusBadRequest, "Bad Request", nil)
+
+	if err := txl.tpl.WriteMsg(res); err != nil {
+		txl.log.Error("Failed to send stateless 400 for malformed request",
+			"error", err,
+			"reason", reason.Error(),
+			"req", req.StartLine(),
+		)
+	}
 }
 
 func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {
@@ -230,7 +263,16 @@ func (txl *TransactionLayer) serverTxCreate(req *Request, key string) (*ServerTx
 	}
 
 	tx := NewServerTx(key, req, conn, txl.log)
-	return tx, tx.Init()
+	if err := tx.Init(); err != nil {
+		// Init failed: this tx never reaches delete(), so release the connection
+		// reference serverRequestConnection took here (mirrors the conn.TryClose
+		// the client path does when it discards a transaction).
+		if conn != nil {
+			conn.TryClose()
+		}
+		return tx, err
+	}
+	return tx, nil
 }
 
 func (txl *TransactionLayer) handleResponseBackground(res *Response) {

@@ -65,6 +65,53 @@ func TestParseHeaders(t *testing.T) {
 			via := h.(*ViaHeader)
 			assert.Equal(t, "UDP", via.Transport)
 		})
+
+		t.Run("IPv6", func(t *testing.T) {
+			// Issue surfaced as livekit/sip#640: viaStateHost previously
+			// walked colons greedily and confused IPv6 separators with the
+			// host:port boundary, producing strconv.Atoi parse errors on
+			// IPv6 Via headers.
+			cases := []struct {
+				name      string
+				header    string
+				wantHost  string
+				wantPort  int
+				wantTrans string
+			}{
+				{
+					name:      "with_port",
+					header:    "Via: SIP/2.0/TCP [2001:67c:b0c:5::192]:5060;branch=z9hG4bKB5mrcD1BXK68a",
+					wantHost:  "2001:67c:b0c:5::192",
+					wantPort:  5060,
+					wantTrans: "TCP",
+				},
+				{
+					name:      "no_port",
+					header:    "Via: SIP/2.0/TCP [2001:67c:b0c:5::192];branch=z9hG4bKB5mrcD1BXK68a",
+					wantHost:  "2001:67c:b0c:5::192",
+					wantPort:  0,
+					wantTrans: "TCP",
+				},
+				{
+					name:      "loopback",
+					header:    "Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bK1234",
+					wantHost:  "::1",
+					wantPort:  5060,
+					wantTrans: "UDP",
+				},
+			}
+
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					h := testParseHeader(t, parser, tc.header)
+					via, ok := h.(*ViaHeader)
+					require.True(t, ok, "expected ViaHeader, got %T", h)
+					assert.Equal(t, tc.wantHost, via.Host, "host mismatch")
+					assert.Equal(t, tc.wantPort, via.Port, "port mismatch")
+					assert.Equal(t, tc.wantTrans, via.Transport, "transport mismatch")
+				})
+			}
+		})
 	})
 
 	t.Run("ToHeader", func(t *testing.T) {
@@ -139,6 +186,23 @@ func TestParseHeaders(t *testing.T) {
 			assert.Equal(t, expected.address, h.Address.String())
 			assert.Equal(t, expected.headers, h.Params)
 		}
+	})
+
+	t.Run("ContactHeaderMultiValue", func(t *testing.T) {
+		header := "Contact: <sip:alice@example.com>;expires=300, <sip:bob@example.com>"
+		out, err := parser.headersParsers.ParseHeader(nil, []byte(header))
+		require.NoError(t, err)
+		require.Len(t, out, 2, "expected two ContactHeader objects")
+
+		first, ok := out[0].(*ContactHeader)
+		require.True(t, ok)
+		assert.Equal(t, "sip:alice@example.com", first.Address.String())
+		assert.Equal(t, HeaderParams{{"expires", "300"}}, first.Params)
+
+		second, ok := out[1].(*ContactHeader)
+		require.True(t, ok)
+		assert.Equal(t, "sip:bob@example.com", second.Address.String())
+		assert.Empty(t, second.Params)
 	})
 
 	t.Run("RouteHeader", func(t *testing.T) {
@@ -364,6 +428,41 @@ func TestParseRequest(t *testing.T) {
 	assert.Equal(t, to.Address.Host+":"+strconv.Itoa(to.Address.Port), "127.0.0.1:5060")
 
 	assert.Equal(t, msg.String(), msgstr)
+}
+
+func TestParseRequestFoldedHeaders(t *testing.T) {
+	rawMsg := []string{
+		"INVITE sip:bob@127.0.0.1:5060 SIP/2.0",
+		"Via: SIP/2.0/UDP 127.0.0.2:5060;",
+		"\tbranch=z9hG4bK-folded",
+		"From: \"Alice\" <sip:alice@127.0.0.2:5060>;tag=1928301774",
+		"To: \"Bob\" <sip:bob@127.0.0.1:5060>",
+		"Call-ID: gotest-folded",
+		"CSeq: 1",
+		" INVITE",
+		"X-Long: alpha  ",
+		"\t beta",
+		" gamma  ",
+		"Content-Length: 0",
+		"",
+		"",
+	}
+
+	parser := NewParser()
+	msg, err := parser.ParseSIP([]byte(strings.Join(rawMsg, "\r\n")))
+	require.NoError(t, err)
+
+	via := msg.Via()
+	require.NotNil(t, via)
+	assert.Equal(t, "z9hG4bK-folded", via.Params.GetOr("branch", ""))
+
+	cseq := msg.CSeq()
+	require.NotNil(t, cseq)
+	assert.Equal(t, INVITE, cseq.MethodName)
+
+	headers := msg.GetHeaders("X-Long")
+	require.Len(t, headers, 1)
+	assert.Equal(t, "alpha beta gamma", headers[0].Value())
 }
 
 func TestParseResponse(t *testing.T) {
