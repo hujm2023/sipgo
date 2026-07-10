@@ -119,6 +119,23 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 	})
 }
 
+func TestServerTransactionRespondRejectsCRLF(t *testing.T) {
+	req := testCreateRequest(t, "OPTIONS", "sip:example.com", "UDP", "127.0.0.1:5060")
+	outgoing := bytes.NewBuffer(nil)
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Writers: map[string]io.Writer{"127.0.0.1:5060": outgoing},
+		},
+	}
+	tx := NewServerTx("123", req, conn, slog.Default())
+
+	res := NewResponseFromRequest(req, StatusOK, "OK\r\nInjected", nil)
+	err := tx.Respond(res)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid CRLF")
+	require.Empty(t, outgoing.String())
+}
+
 func TestServerTransactionFSMInvite(t *testing.T) {
 	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 
@@ -170,4 +187,23 @@ func TestServerTransactionContext(t *testing.T) {
 	tx.Terminate()
 	require.Equal(t, context.Canceled, ctx.Err())
 	require.Equal(t, ErrTransactionTerminated, tx.Err())
+}
+
+func TestServerTransactionReleasesConnRef(t *testing.T) {
+	req := testCreateRequest(t, "OPTIONS", "sip:example.com", "UDP", "127.0.0.1:5060")
+	conn := &UDPConnection{
+		PacketConn: &fakes.UDPConn{
+			Reader:  bytes.NewBuffer([]byte{}),
+			Writers: map[string]io.Writer{},
+		},
+	}
+	conn.Ref(2) // serverRequestConnection holds a reference before NewServerTx
+
+	tx := NewServerTx("123", req, conn, slog.Default())
+	require.NoError(t, tx.Init())
+
+	tx.Terminate()
+	<-tx.Done()
+
+	require.Equal(t, 1, conn.Ref(0), "Terminate must release exactly one connection reference")
 }

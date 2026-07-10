@@ -11,7 +11,10 @@ It comes with [SIP stack](/sip/README.md) ([RFC 3261](https://datatracker.ietf.o
 
 
 **Libs on top of sipgo:**
-- ***diago*** [github.com/emiago/diago](https://github.com/emiago/diago): Full VOIP library/framework with media stack (Active development)
+- ***Diago*** [github.com/emiago/diago](https://github.com/emiago/diago): Full VOIP library/framework with media stack (Active development)
+
+**Tools developed on top:**
+- ***Gophone*** [github.com/emiago/gophone](https://github.com/emiago/gophone) CLI softphone for easy testing 
 
 
 Fetch lib with:
@@ -224,10 +227,19 @@ select {
 
 ```
 
+
+
+
+
 #### CSEQ Header increase rule: 
 1. Every new transaction will have **implicitely** CSEQ increase if present -> [Issue 160](https://github.com/hujm2023/sipgo/issues/160). This fixes problem when you are passing same request like ex. REGISTER
 2. Above rule does not apply for In Dialog cases
 2. To avoid 1. pass option `client.TransactionRequest(ctx, req, sipgo.ClientRequestBuild)` or more better used `DialogClient`
+
+## SECURITY
+
+**CRLF injection**:
+For user input building request or response, use `sip.ValidateRequest` and `sip.ValidateResponse` before passing to transaction or transport.
 
 ## Client stateless request
 
