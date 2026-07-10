@@ -3,6 +3,7 @@ package sip
 import (
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"runtime"
 	"strings"
@@ -406,6 +407,31 @@ func TestParserStreamMessageSizeLimitBody(t *testing.T) {
 	_, err := parser.parseSIPStreamFull(data)
 	require.Error(t, err)
 	require.Equal(t, ErrMessageTooLarge, err)
+}
+
+func TestParserStreamRejectsOversizedContentLengthBeforeBody(t *testing.T) {
+	tests := []struct {
+		name          string
+		contentLength uint64
+	}{
+		{name: "eight MiB", contentLength: 8 << 20},
+		{name: "uint32 maximum", contentLength: math.MaxUint32},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := NewParser().NewSIPStream()
+			header := fmt.Sprintf(
+				"INVITE sip:test@example.test SIP/2.0\r\nContent-Length: %d\r\n\r\n",
+				tt.contentLength,
+			)
+
+			_, err := parser.Write([]byte(header))
+			require.NoError(t, err)
+			_, _, err = parser.ParseNext()
+			require.ErrorIs(t, err, ErrMessageTooLarge)
+		})
+	}
 }
 
 func TestParserStreamMessageSizeLimitHeaders(t *testing.T) {

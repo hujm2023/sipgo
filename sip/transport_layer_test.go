@@ -152,6 +152,45 @@ func TestTransportLayerReadFilterTCPErrorStopsRead(t *testing.T) {
 	}
 }
 
+func TestTransportTCPClosesConnectionAfterOversizedMessage(t *testing.T) {
+	tcp := &TransportTCP{}
+	tcp.init(NewParser())
+
+	closed := make(chan struct{})
+	tcp.onConnClose = func(conn Connection) {
+		close(closed)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	conn := &TCPConnection{
+		Conn:     serverConn,
+		refcount: 1,
+	}
+
+	handled := make(chan struct{}, 1)
+	go tcp.readConnection(conn, serverConn.LocalAddr().String(), serverConn.RemoteAddr().String(), func(msg Message) {
+		handled <- struct{}{}
+	})
+
+	header := "INVITE sip:test@example.test SIP/2.0\r\nContent-Length: 8388608\r\n\r\n"
+	_, err := clientConn.Write([]byte(header))
+	require.NoError(t, err)
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected TCP connection to close after oversized message")
+	}
+
+	select {
+	case <-handled:
+		t.Fatal("handler should not be called for an oversized message")
+	default:
+	}
+}
+
 func TestTransportLayerClientConnectionReuse(t *testing.T) {
 	// NOTE it creates real network connection
 	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
