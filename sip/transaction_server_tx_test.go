@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"testing"
 	"time"
 
@@ -160,6 +161,88 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 		require.Eventually(t, func() bool {
 			return compareFunctions(tx.currentFsmState(), tx.inviteStateTerminated) == nil
 		}, 10*Timer_I, Timer_I)
+	})
+}
+
+func TestServerTransactionTerminateGracefullyReliableInvite(t *testing.T) {
+	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "TCP", "127.0.0.2:5060")
+	newConn := func() *TCPConnection {
+		conn := &TCPConnection{Conn: &fakes.TCPConn{
+			LAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060},
+			RAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5060},
+			Reader: bytes.NewBuffer(nil),
+			Writer: bytes.NewBuffer(nil),
+		}}
+		conn.Ref(1)
+		return conn
+	}
+
+	t.Run("Non2xxWaitsForACK", func(t *testing.T) {
+		key, err := ServerTxKeyMake(req)
+		require.NoError(t, err)
+
+		handlerCalled := false
+		txl := &TransactionLayer{
+			clientTransactions: newTransactionStore[*ClientTx](),
+			serverTransactions: newTransactionStore[*ServerTx](),
+			reqHandler: func(_ *Request, _ *ServerTx) {
+				handlerCalled = true
+			},
+			log: slog.Default(),
+		}
+		tx := NewServerTx(key, req, newConn(), slog.Default())
+		require.True(t, tx.OnTerminate(txl.serverTxTerminate))
+		txl.serverTransactions.items[key] = tx
+		require.NoError(t, tx.Init())
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)))
+
+		gracefulDone := make(chan struct{})
+		go func() {
+			tx.TerminateGracefully()
+			close(gracefulDone)
+		}()
+
+		select {
+		case <-gracefulDone:
+			t.Fatal("reliable INVITE server transaction terminated before receiving non-2xx ACK")
+		case <-time.After(20 * time.Millisecond):
+		}
+		_, exists := txl.getServerTx(key)
+		require.True(t, exists, "reliable INVITE transaction must remain registered until non-2xx ACK")
+
+		ack := req.Clone()
+		ack.Method = ACK
+		ack.CSeq().MethodName = ACK
+		require.NoError(t, txl.handleRequest(ack))
+		require.False(t, handlerCalled, "matched non-2xx ACK must not reach the application request handler")
+
+		require.Eventually(t, func() bool {
+			select {
+			case <-gracefulDone:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateTerminated))
+		require.Eventually(t, func() bool {
+			_, exists := txl.getServerTx(key)
+			return !exists
+		}, time.Second, time.Millisecond)
+	})
+
+	t.Run("2xxTerminatesImmediately", func(t *testing.T) {
+		tx := NewServerTx("456", req, newConn(), slog.Default())
+		require.NoError(t, tx.Init())
+		require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+
+		tx.TerminateGracefully()
+
+		select {
+		case <-tx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("reliable INVITE 2xx transaction did not terminate immediately")
+		}
 	})
 }
 

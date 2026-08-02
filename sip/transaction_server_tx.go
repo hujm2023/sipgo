@@ -161,18 +161,22 @@ func (tx *ServerTx) Terminate() {
 	}
 }
 
-// TerminateGracefully allows retransmission to happen before shuting down transaction
+// TerminateGracefully allows retransmission to happen before shutting down transaction.
 func (tx *ServerTx) TerminateGracefully() {
-	if tx.reliable {
-		// reliable transports have no retransmission, so it is better just to terminate
+	tx.fsmMu.Lock()
+	finalized := tx.fsmResp != nil && !tx.fsmResp.IsProvisional()
+	waitsForInviteACK := tx.reliable && tx.origin.IsInvite() && finalized && tx.fsmResp.StatusCode >= 300
+	tx.fsmMu.Unlock()
+
+	if tx.reliable && !waitsForInviteACK {
+		// Reliable transports do not retransmit responses. A non-2xx INVITE is
+		// the exception: its server transaction must remain available to match
+		// the hop-by-hop ACK until Timer H fires.
 		tx.Terminate()
 		return
 	}
 
-	// Check did we receive final response
-	tx.fsmMu.Lock()
-	finalized := tx.fsmResp != nil && !tx.fsmResp.IsProvisional()
-	tx.fsmMu.Unlock()
+	// Check whether we received a final response.
 	if !finalized {
 		tx.Terminate()
 		return
