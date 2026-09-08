@@ -273,3 +273,65 @@ func TestServerTransactionReleasesConnRef(t *testing.T) {
 
 	require.Equal(t, 1, conn.Ref(0), "Terminate must release exactly one connection reference")
 }
+
+// A non-2xx ACK completes the SIP transaction independently of application
+// consumption. Its one notification must remain available to a late consumer.
+func TestServerTransactionNon2xxACKWithoutConsumer(t *testing.T) {
+	for _, transport := range []string{"UDP", "TCP"} {
+		t.Run(transport, func(t *testing.T) {
+			req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", transport, "127.0.0.2:5060")
+			conn := &TCPConnection{Conn: &fakes.TCPConn{
+				LAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060},
+				RAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5060},
+				Reader: bytes.NewBuffer(nil), Writer: bytes.NewBuffer(nil),
+			}}
+			conn.Ref(1)
+			tx := NewServerTx("late-consumer", req, conn, slog.Default())
+			require.NoError(t, tx.Init())
+			defer tx.Terminate()
+			require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusBusyHere, "Busy Here", nil)))
+			ack := req.Clone()
+			ack.Method, ack.CSeq().MethodName = ACK, ACK
+			require.NoError(t, tx.Receive(ack))
+			require.Len(t, tx.Acks(), 1, "ACK must be retained without a waiting application goroutine")
+			if transport == "UDP" {
+				require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateConfirmed))
+				require.NoError(t, tx.Receive(ack))
+				require.Len(t, tx.Acks(), 1, "duplicate non-2xx ACK must not create another notification")
+			}
+			tx.Terminate()
+			select {
+			case got := <-tx.Acks():
+				require.Same(t, ack, got)
+			default:
+				t.Fatal("transaction completion discarded the received ACK notification")
+			}
+		})
+	}
+}
+
+func TestServerTransactionAcceptedACKNotifications(t *testing.T) {
+	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "TCP", "127.0.0.2:5060")
+	conn := &TCPConnection{Conn: &fakes.TCPConn{
+		LAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060},
+		RAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 5060},
+		Reader: bytes.NewBuffer(nil), Writer: bytes.NewBuffer(nil),
+	}}
+	conn.Ref(1)
+	tx := NewServerTx("accepted-acks", req, conn, slog.Default())
+	require.NoError(t, tx.Init())
+	defer tx.Terminate()
+	require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+	for i := 0; i < 2; i++ {
+		ack := req.Clone()
+		ack.Method, ack.CSeq().MethodName = ACK, ACK
+		require.NoError(t, tx.Receive(ack))
+		select {
+		case got := <-tx.Acks():
+			require.Same(t, ack, got)
+		case <-time.After(time.Second):
+			t.Fatal("accepted transaction stopped delivering ACK notifications")
+		}
+		require.NoError(t, compareFunctions(tx.currentFsmState(), tx.inviteStateAccepted))
+	}
+}

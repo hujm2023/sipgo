@@ -28,8 +28,9 @@ func NewServerTx(key string, origin *Request, conn Connection, logger *slog.Logg
 	tx.key = key
 	tx.conn = conn
 
-	// about ~10 retransmits
-	tx.acks = make(chan *Request)
+	// Retain the first ACK independently of application consumption. A non-2xx
+	// INVITE is confirmed once, and reliable transports terminate immediately.
+	tx.acks = make(chan *Request, 1)
 	// tx.cancels = make(chan *Request)
 	tx.done = make(chan struct{})
 	tx.log = logger
@@ -127,7 +128,7 @@ func (tx *ServerTx) Respond(res *Response) error {
 	return tx.Err()
 }
 
-// Acks makes channel for sending acks. Channel is created on demand
+// Acks returns ACK notifications. The first ACK is retained for a late consumer.
 func (tx *ServerTx) Acks() <-chan *Request {
 	return tx.acks
 }
