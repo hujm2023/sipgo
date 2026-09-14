@@ -231,6 +231,10 @@ var (
 // WaitAnswer waits for success response or returns ErrDialogResponse in case non 2xx
 // Canceling context while waiting 2xx will send Cancel request. It will block until 1xx provisional is not received
 // If Canceling succesfull context.Canceled error is returned
+// Provisional responses are not counted nor bounded: UAS may send any number of them before
+// a final response (RFC 3261 section 13.3.1.1). Once the first provisional is received, the
+// client transaction moves to Proceeding and Timer B is stopped, hence waiting is bounded only
+// by caller's ctx. Callers that need an overall answer deadline must provide a bounded context.
 // Returns errors:
 // - ErrDialogResponse in case non 2xx response
 // - any internal in case waiting answer failed for different reasons
@@ -238,11 +242,7 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 	tx, inviteRequest := s.inviteTx, s.InviteRequest
 	var r *sip.Response
 	var err error
-	for i := 0; ; i++ {
-		if i > 10 {
-			// Preventing some long loops
-			return fmt.Errorf("more than 10 responses received")
-		}
+	for {
 		select {
 		case r = <-tx.Responses():
 			s.InviteResponse = r

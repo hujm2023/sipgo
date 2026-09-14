@@ -161,14 +161,24 @@ func TestDialogClientMultiResponses(t *testing.T) {
 		}
 		d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
 		require.NoError(t, err)
+
+		tx := d.inviteTx.(*sip.ClientTx)
 		go func() {
-			// Receive more provisional
-			for i := 0; i < 10; i++ {
-				d.inviteTx.(*sip.ClientTx).Receive(sip.NewResponseFromRequest(d.InviteRequest, 100, "Trying", nil))
+			// A UAS may send any number of provisional responses before the final response
+			// (RFC 3261 section 13.3.1.1), so they must not end the wait.
+			for i := 0; i < 12; i++ {
+				tx.Receive(sip.NewResponseFromRequest(d.InviteRequest, 183, "Session Progress", nil))
 			}
+			tx.Receive(sip.NewResponseFromRequest(d.InviteRequest, 200, "OK", nil))
 		}()
-		err = d.WaitAnswer(context.TODO(), AnswerOptions{})
-		require.Error(t, err)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		require.NoError(t, d.WaitAnswer(ctx, AnswerOptions{}))
+		require.NotNil(t, d.InviteResponse)
+		assert.Equal(t, 200, d.InviteResponse.StatusCode)
+		assert.Equal(t, sip.DialogStateEstablished, d.LoadState())
 	})
 	t.Run("ProxyAuthLoop", func(t *testing.T) {
 		var sentReq *sip.Request
