@@ -8,3 +8,4 @@ certs
 /example/astscale
 /go.work
 /LONG_BENCHES.md
+.worktrees/
