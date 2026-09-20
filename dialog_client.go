@@ -500,11 +500,11 @@ func newAckRequestUAC(inviteRequest *sip.Request, inviteResponse *sip.Response, 
 	ackRequest.SipVersion = inviteRequest.SipVersion
 
 	// ACK to 2xx response should not copy over Route header(s) from original INVITE request.
-	// Instead the ACK should include Route header(s) derived from reversing the order of 
-	// Record-Route header(s) in the 2xx response. 
+	// Instead the ACK should include Route header(s) derived from reversing the order of
+	// Record-Route header(s) in the 2xx response.
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-12.1.2
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-12.2.1.1
-	
+
 	if h := inviteRequest.From(); h != nil {
 		ackRequest.AppendHeader(sip.HeaderClone(h))
 	}
@@ -593,6 +593,10 @@ func newByeRequestUAC(inviteRequest *sip.Request, inviteResponse *sip.Response, 
 	byeRequest.SetBody(body)
 	byeRequest.SetTransport(inviteRequest.Transport())
 	byeRequest.SetSource(inviteRequest.Source())
+	// Keep using the INVITE's local bind so BYE reuses the same bound socket
+	// instead of opening an ephemeral one. ACK and CANCEL constructors already
+	// inherit Laddr; a zero INVITE Laddr stays zero for callers that do not bind.
+	byeRequest.Laddr = inviteRequest.Laddr
 	return byeRequest
 }
 

@@ -3,6 +3,7 @@ package sipgo
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -287,4 +288,22 @@ func BenchmarkDialogDo(b *testing.B) {
 		}
 	})
 
+}
+
+func TestNewByeRequestUACInheritsInviteLaddr(t *testing.T) {
+	invite := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", User: "bob", Host: "127.0.0.1", Port: 5060})
+	invite.SetTransport("UDP")
+	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
+	invite.Laddr = sip.Addr{IP: net.ParseIP("10.0.0.7"), Port: 5068}
+
+	resp := sip.NewResponseFromRequest(invite, 200, "OK", nil)
+	bye := newByeRequestUAC(invite, resp, nil)
+	assert.Equal(t, invite.Laddr, bye.Laddr)
+
+	// Zero INVITE Laddr stays zero for callers that do not bind locally.
+	unboundInvite := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", User: "bob", Host: "127.0.0.1", Port: 5060})
+	unboundInvite.SetTransport("UDP")
+	unboundInvite.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
+	unboundBye := newByeRequestUAC(unboundInvite, sip.NewResponseFromRequest(unboundInvite, 200, "OK", nil), nil)
+	assert.Equal(t, sip.Addr{}, unboundBye.Laddr)
 }
