@@ -15,6 +15,14 @@ import (
 var (
 	// Used only for testing, better way is to pass listener with Serve{Transport}
 	ListenReadyCtxKey = "ListenReadyCtxKey"
+
+	// ListenRegisteredCtxKey is fired after the listener socket has been
+	// registered in the transport connection pool and its receive loop is
+	// equipped, so the bound connection is reusable by the client.
+	// ListenReadyCtxKey only proves the socket was bound and keeps its old
+	// semantics; this key is currently emitted only for UDP and MUST be
+	// delivered without blocking the serving goroutine.
+	ListenRegisteredCtxKey = "ListenRegisteredCtxKey"
 )
 
 type ListenReadyCtxValue chan struct{}
@@ -25,6 +33,23 @@ func listenReadyCtx(ctx context.Context, network string, addr string) {
 		switch vv := v.(type) {
 		case ListenReadyCtxValue:
 			vv <- struct{}{}
+		case ListenReadyFuncCtxValue:
+			vv(network, addr)
+		}
+	}
+}
+
+// listenRegisteredCtx notifies waiters that the UDP listener is registered in
+// the pool and receiving. The channel variant is non-blocking on purpose: an
+// absent or saturated consumer must never stall the serving goroutine.
+func listenRegisteredCtx(ctx context.Context, network string, addr string) {
+	if v := ctx.Value(ListenRegisteredCtxKey); v != nil {
+		switch vv := v.(type) {
+		case ListenReadyCtxValue:
+			select {
+			case vv <- struct{}{}:
+			default:
+			}
 		case ListenReadyFuncCtxValue:
 			vv(network, addr)
 		}
@@ -127,7 +152,9 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 
 		connCloser = udpConn
 		listenReadyCtx(ctx, network, udpConn.LocalAddr().String())
-		return srv.tp.ServeUDP(udpConn)
+		return srv.tp.ServeUDPWithReady(udpConn, func() {
+			listenRegisteredCtx(ctx, network, udpConn.LocalAddr().String())
+		})
 
 	case "tcp", "tcp4", "tcp6":
 		laddr, err := net.ResolveTCPAddr(network, addr)

@@ -49,6 +49,20 @@ func (t *TransportUDP) Close() error {
 
 // ServeConn is direct way to provide conn on which this worker will listen
 func (t *TransportUDP) Serve(conn net.PacketConn, handler MessageHandler) error {
+	return t.serve(conn, handler, nil)
+}
+
+// ServeWithReady acts as Serve but invokes onReady exactly once after the
+// listener connection has been registered in the pool and the receive loop is
+// equipped. onReady MUST NOT block: it runs inside the serving goroutine
+// before the first ReadFrom. The kernel UDP receive buffer keeps accepting
+// datagrams in that tiny window, so callers can use this signal to prove the
+// bound connection is reusable without probing the port.
+func (t *TransportUDP) ServeWithReady(conn net.PacketConn, handler MessageHandler, onReady func()) error {
+	return t.serve(conn, handler, onReady)
+}
+
+func (t *TransportUDP) serve(conn net.PacketConn, handler MessageHandler, onReady func()) error {
 	t.log.Debug("begin listening", "network", t.Network(), "addr", conn.LocalAddr().String())
 	/*
 		Multiple readers makes problem, which can delay writing response
@@ -60,7 +74,20 @@ func (t *TransportUDP) Serve(conn net.PacketConn, handler MessageHandler) error 
 	}
 
 	t.pool.Add(c.PacketAddr, c)
-	t.readListenerConnection(c, c.PacketAddr, handler)
+
+	// The read loop used to run on the calling goroutine. Run it in a
+	// dedicated goroutine so readiness is reported only after pool
+	// registration and receiver setup, while keeping Serve blocked until the
+	// listener is closed.
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		if onReady != nil {
+			onReady()
+		}
+		t.readListenerConnection(c, c.PacketAddr, handler)
+	}()
+	<-serveDone
 	return nil
 }
 

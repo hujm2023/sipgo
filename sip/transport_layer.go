@@ -239,6 +239,14 @@ func (l *TransportLayer) handleMessage(msg Message) {
 
 // ServeUDP will listen on udp connection
 func (l *TransportLayer) ServeUDP(c net.PacketConn) error {
+	return l.ServeUDPWithReady(c, nil)
+}
+
+// ServeUDPWithReady acts as ServeUDP but invokes onReady after the listener
+// connection has been registered in the UDP connection pool and its receive
+// loop is equipped. onReady MUST NOT block. This is the UDP-only signal:
+// bind-time readiness is reported separately by Server.ListenAndServe.
+func (l *TransportLayer) ServeUDPWithReady(c net.PacketConn, onReady func()) error {
 	_, port, err := ParseAddr(c.LocalAddr().String())
 	if err != nil {
 		return err
@@ -246,7 +254,7 @@ func (l *TransportLayer) ServeUDP(c net.PacketConn) error {
 
 	l.addListenPort("udp", port)
 
-	return l.udp.Serve(c, l.handleMessage)
+	return l.udp.ServeWithReady(c, l.handleMessage, onReady)
 }
 
 // ServeTCP will listen on tcp connection

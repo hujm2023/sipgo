@@ -375,3 +375,69 @@ func TestTransportLayerResolving(t *testing.T) {
 	assert.True(t, addr.IP.To4() != nil)
 	assert.Equal(t, "127.0.0.1:0", addr.String())
 }
+
+func TestServeUDPWithReadyRegistersListenerAndEquipsReceiver(t *testing.T) {
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	defer tp.Close()
+
+	listenerConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	msgs := make(chan Message, 1)
+	tp.OnMessage(func(msg Message) {
+		msgs <- msg
+	})
+
+	ready := make(chan struct{}, 1)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- tp.ServeUDPWithReady(listenerConn, func() {
+			ready <- struct{}{}
+		})
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready callback not invoked")
+	}
+
+	localAddr := listenerConn.LocalAddr().String()
+
+	// After ready the listener exists in the pool under its actual local
+	// address, so client requests carrying this Laddr reuse this connection.
+	c, err := tp.GetConnection("udp", localAddr)
+	require.NoError(t, err)
+	// GetConnection adds one reference; pair it. Listener TryClose decrements
+	// the count without closing the socket, so it must still be alive.
+	ref, err := c.TryClose()
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, ref, 1, "listener connection must remain open after paired TryClose")
+
+	// The receive loop is equipped and handles incoming datagrams.
+	peerConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer peerConn.Close()
+	serverAddr, err := net.ResolveUDPAddr("udp", localAddr)
+	require.NoError(t, err)
+	_, err = peerConn.WriteTo(testRawOptions("ready-call"), serverAddr)
+	require.NoError(t, err)
+
+	select {
+	case msg := <-msgs:
+		assert.Equal(t, "ready-call", msg.CallID().Value())
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive loop did not handle datagram after ready")
+	}
+
+	// Closing the listener ends Serve and removes it from the pool.
+	require.NoError(t, listenerConn.Close())
+	select {
+	case err := <-serveErr:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after listener close")
+	}
+	_, err = tp.GetConnection("udp", localAddr)
+	assert.Error(t, err, "listener must be removed from pool after close")
+}
