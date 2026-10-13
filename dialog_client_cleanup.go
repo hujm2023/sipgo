@@ -197,28 +197,18 @@ func (c *lateAnswerCleanup) worker() {
 				protocolTimer.Reset(time.Until(deadline))
 				continue
 			}
-			c.stop()
+			// Natural protocol expiry closes response admission, not the
+			// independently registered product tasks. They retain their original budget.
+			c.closeInput()
 			return
 		case <-inviteDone:
-			c.stop()
+			c.closeInput()
 			return
 		case res := <-c.queue:
 			c.handle(res)
 		case <-c.ctx.Done():
 			return
 		case <-c.inputGone:
-			c.drain()
-			return
-		}
-	}
-}
-
-func (c *lateAnswerCleanup) drain() {
-	for {
-		select {
-		case res := <-c.queue:
-			c.handle(res)
-		default:
 			return
 		}
 	}
@@ -309,6 +299,12 @@ func (c *lateAnswerCleanup) viewOf(res *sip.Response) (*lateDialogView, bool) {
 // startByeTask registers exactly one logical BYE per dialog. The task is owned
 // by the controller (tracked in tasksWG), then joined by its UA at shutdown.
 func (c *lateAnswerCleanup) startByeTask(view *lateDialogView, res *sip.Response) {
+	// Claim and register under the admission lock. Close cannot race a later Add.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
 	view.mu.Lock()
 	if view.byeStarted || view.ctx.Err() != nil {
 		view.mu.Unlock()
