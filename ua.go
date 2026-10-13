@@ -2,10 +2,18 @@ package sipgo
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
+	"time"
 
 	"github.com/hujm2023/sipgo/sip"
 )
+
+// ErrUserAgentReliableWriteTimeout is returned by
+// WithUserAgentReliableWriteTimeout for a non-positive timeout. There is no
+// "0 means unlimited" contract: enabling the protection always requires a
+// positive budget, and not passing the option leaves the legacy behavior.
+var ErrUserAgentReliableWriteTimeout = errors.New("reliable write timeout must be positive")
 
 type UserAgent struct {
 	name        string
@@ -17,6 +25,9 @@ type UserAgent struct {
 	tpOptions   []sip.TransportLayerOption
 	tp          *sip.TransportLayer
 	tx          *sip.TransactionLayer
+
+	// reliableWriteTimeout explicitly enables bounded TCP/TLS writes when > 0.
+	reliableWriteTimeout time.Duration
 }
 
 type UserAgentOption func(s *UserAgent) error
@@ -80,6 +91,30 @@ func WithUserAgentTransportLayerOptions(o ...sip.TransportLayerOption) UserAgent
 	}
 }
 
+// WithUserAgentReliableWriteTimeout explicitly enables a write budget for every
+// real TCP/TLS write of this UserAgent: outbound submits, inbound (accepted)
+// responses and the automatic ACK/retransmission writes performed by the
+// transaction FSMs. VoIPGo passes 2s.
+//
+// It is opt-in and off by default, so existing callers keep the legacy
+// unbounded writes. Protocol timers (Timer A/B/D/H/J/M/L, retransmission
+// windows, transaction identity) are untouched: this only bounds how long a
+// single socket write may block. Because the protection is enforced by the
+// connection owner, there is no per-call budget to reset and no per-transaction
+// deadline to clear.
+//
+// A non-positive timeout is rejected instead of being silently interpreted as
+// "unlimited".
+func WithUserAgentReliableWriteTimeout(timeout time.Duration) UserAgentOption {
+	return func(s *UserAgent) error {
+		if timeout <= 0 {
+			return ErrUserAgentReliableWriteTimeout
+		}
+		s.reliableWriteTimeout = timeout
+		return nil
+	}
+}
+
 // NewUA creates User Agent
 // User Agent will create transport and transaction layer
 // Check options for customizing user agent
@@ -97,7 +132,16 @@ func NewUA(options ...UserAgentOption) (*UserAgent, error) {
 		}
 	}
 
-	ua.tp = sip.NewTransportLayer(ua.dnsResolver, ua.parser, ua.tlsConfig, ua.tpOptions...)
+	// The reliable write protection is appended last so it survives any
+	// WithUserAgentTransportLayerOptions replacement, without mutating the
+	// caller's slice.
+	tpOptions := ua.tpOptions
+	if ua.reliableWriteTimeout > 0 {
+		tpOptions = append(append([]sip.TransportLayerOption(nil), tpOptions...),
+			sip.WithTransportLayerReliableWriteTimeout(ua.reliableWriteTimeout))
+	}
+
+	ua.tp = sip.NewTransportLayer(ua.dnsResolver, ua.parser, ua.tlsConfig, tpOptions...)
 	ua.tx = sip.NewTransactionLayer(ua.tp, ua.txOptions...)
 	return ua, nil
 }

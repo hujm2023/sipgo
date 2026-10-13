@@ -81,6 +81,26 @@ func WithTransportLayerReadFilter(f TransportReadFilter) TransportLayerOption {
 	}
 }
 
+// WithTransportLayerReliableWriteTimeout installs a write budget on every
+// TCP/TLS connection of this layer, outbound and inbound alike. Once a write has
+// actually started, the budget unblocks it by hard-closing that exact
+// connection; while the write is still queued, the budget only makes the queued
+// caller return without touching the connection.
+//
+// It is opt-in: without this option (or the UserAgent level
+// WithUserAgentReliableWriteTimeout) TCP/TLS writes keep their legacy unbounded
+// behavior, including automatic ACK and retransmission writes. Protocol timers
+// are not affected. Non-positive values are ignored, so the option can be built
+// from configuration without enabling anything.
+func WithTransportLayerReliableWriteTimeout(timeout time.Duration) TransportLayerOption {
+	return func(l *TransportLayer) {
+		if timeout <= 0 {
+			return
+		}
+		l.reliableWriteTimeout = timeout
+	}
+}
+
 // TODO will be exposed
 // withTransportLayerDNSLookupIP allows to set which ip4 or ip6 to prefer on resolve
 // default is ip4

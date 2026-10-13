@@ -18,6 +18,14 @@ import (
 // never reads from them, so a writer on the other side really blocks.
 func stalledPeerListener(t *testing.T) string {
 	t.Helper()
+	addr, _ := stalledPeer(t)
+	return addr
+}
+
+// stalledPeer is stalledPeerListener plus a closer that releases every accepted
+// connection, used to finish a deliberately unbounded write.
+func stalledPeer(t *testing.T) (string, func()) {
+	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -51,7 +59,15 @@ func stalledPeerListener(t *testing.T) string {
 		}
 	}()
 
-	return ln.Addr().String()
+	closeAccepted := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range accepted {
+			_ = c.Close()
+		}
+	}
+
+	return ln.Addr().String(), closeAccepted
 }
 
 // drainingPeerListener accepts connections and consumes everything, so writes
@@ -194,10 +210,21 @@ type respondResult struct {
 	tx      *sip.ServerTx
 }
 
-func newStalledServer(t *testing.T, result chan<- respondResult, respond func(req *sip.Request, tx *sip.ServerTx) *sip.Response) (*Server, string) {
+// serverRespondMode selects the response entry point used by the test handler.
+type serverRespondMode int
+
+const (
+	// respondWithContext uses ServerTx.RespondContext with a short caller budget.
+	respondWithContext serverRespondMode = iota
+	// respondLegacy uses ServerTx.Respond, i.e. no caller context at all.
+	respondLegacy
+)
+
+func newStalledServer(t *testing.T, uaOpts []UserAgentOption, mode serverRespondMode, result chan<- respondResult, respond func(req *sip.Request, tx *sip.ServerTx) *sip.Response) (*Server, string) {
 	t.Helper()
 
-	ua, err := NewUA(WithUserAgentHostname("127.0.0.1"))
+	opts := append([]UserAgentOption{WithUserAgentHostname("127.0.0.1")}, uaOpts...)
+	ua, err := NewUA(opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { ua.Close() })
 
@@ -211,11 +238,16 @@ func newStalledServer(t *testing.T, result chan<- respondResult, respond func(re
 		}
 
 		res := respond(req, stx)
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		defer cancel()
 
 		start := time.Now()
-		err := stx.RespondContext(ctx, res)
+		var err error
+		if mode == respondLegacy {
+			err = stx.Respond(res)
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			err = stx.RespondContext(ctx, res)
+		}
 		result <- respondResult{err: err, elapsed: time.Since(start), tx: stx}
 	})
 
@@ -270,7 +302,7 @@ func dialStalledRawClient(t *testing.T, addr string) net.Conn {
 func TestServerTxRespondContextUnblocksStalledTCPPeer(t *testing.T) {
 	result := make(chan respondResult, 1)
 
-	_, addr := newStalledServer(t, result, func(req *sip.Request, tx *sip.ServerTx) *sip.Response {
+	_, addr := newStalledServer(t, nil, respondWithContext, result, func(req *sip.Request, tx *sip.ServerTx) *sip.Response {
 		res := sip.NewResponseFromRequest(req, 486, "Busy Here", nil)
 		res.SetBody(bytes.Repeat([]byte("r"), 4<<20))
 		return res
@@ -299,7 +331,7 @@ func TestServerTxRespondContextUnblocksStalledTCPPeer(t *testing.T) {
 func TestServerTxRespondContextDeliversToReadingPeer(t *testing.T) {
 	result := make(chan respondResult, 1)
 
-	_, addr := newStalledServer(t, result, func(req *sip.Request, tx *sip.ServerTx) *sip.Response {
+	_, addr := newStalledServer(t, nil, respondWithContext, result, func(req *sip.Request, tx *sip.ServerTx) *sip.Response {
 		return sip.NewResponseFromRequest(req, 486, "Busy Here", nil)
 	})
 
