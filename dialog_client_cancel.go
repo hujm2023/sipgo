@@ -99,8 +99,10 @@ type inviteTeardown struct {
 	finalCancel context.CancelFunc
 	cancelCtx   context.Context
 	cancelStop  context.CancelFunc
-	cleanupCtx  context.Context
-	cleanupStop context.CancelFunc
+
+	// cleanup owns every protocol duty triggered by a late/duplicate 2xx. It
+	// starts lazily and is joined before the teardown returns.
+	cleanup *lateAnswerCleanup
 
 	wg sync.WaitGroup
 
@@ -140,8 +142,12 @@ func (t *inviteTeardown) run(ctx context.Context) error {
 	t.cancelCtx, t.cancelStop = context.WithTimeout(base, t.policy.CancelTimeout)
 	defer t.cancelStop()
 
-	t.cleanupCtx, t.cleanupStop = context.WithTimeout(base, t.policy.CleanupTimeout)
-	defer t.cleanupStop()
+	t.cleanup = newLateAnswerCleanup(t.session, base, t.policy.CleanupTimeout)
+
+	// Duplicated 2xx responses are only reported through the transaction
+	// retransmission notification, and each of them still needs its ACK. The
+	// notification never runs protocol work itself.
+	t.invite.OnRetransmission(t.cleanup.notify)
 
 	t.log().Debug("invite teardown started",
 		"cancel_timeout", t.policy.CancelTimeout,
@@ -160,15 +166,21 @@ func (t *inviteTeardown) run(ctx context.Context) error {
 	// Independent consumers: the INVITE keeps being consumed until its own
 	// final response or the deadline fixed when the teardown started.
 	t.wg.Wait()
-
-	// The transaction is released only after nobody consumes it anymore.
-	t.invite.Terminate()
+	t.cleanup.closeInput()
 
 	if res := t.lastFinalResponse(); res != nil {
 		t.session.InviteResponse = res
 	}
 
-	return errors.Join(ctx.Err(), cancelErr, t.inviteError(), t.observerError())
+	// The protocol cleanup owns its own budget and is joined here, so the caller
+	// never releases its fence while an ACK/BYE task is still running. The INVITE
+	// transaction stays alive until then: responses already matched by the
+	// transaction layer must still be able to reach the cleanup and get their
+	// ACK instead of being dropped while the cleanup drains.
+	cleanupErr := t.cleanup.join()
+	t.invite.Terminate()
+
+	return errors.Join(ctx.Err(), cancelErr, t.inviteError(), t.observerError(), cleanupErr)
 }
 
 func (t *inviteTeardown) log() *slog.Logger {
@@ -284,6 +296,12 @@ func (t *inviteTeardown) observe(res *sip.Response) {
 		t.provisionalOnce.Do(func() { close(t.firstProvisional) })
 	} else {
 		t.finalOnce.Do(func() { close(t.firstFinal) })
+	}
+
+	if !res.IsProvisional() {
+		// A late/duplicate 2xx is cleaned up by the owned worker, never on this
+		// stack and never with an unowned goroutine per response.
+		t.cleanup.enqueue(res)
 	}
 
 	// The caller observer keeps its own evidence of what really arrived. Its

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 
@@ -86,14 +87,23 @@ func (p *connectionPool) init() {
 	p.m = make(map[string]Connection)
 }
 
-func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do func() (Connection, error)) (Connection, error) {
+// addSingleflight returns an existing connection or shares one in-flight
+// creation with other callers of the same key.
+//
+// The waiter honors ctx: giving up while the shared call is still running
+// returns immediately instead of blocking behind another caller's dial. The
+// in-flight creation stays owned by the singleflight itself; its result is
+// cached in the pool (or dropped on error) even when nobody waits for it
+// anymore, so an abandoned wait never leaves an unowned dial or a leaked
+// connection.
+func (p *connectionPool) addSingleflight(ctx context.Context, raddr Addr, laddr Addr, reuse bool, do func() (Connection, error)) (Connection, error) {
 	a := raddr.String()
 
 	if laddr.Port > 0 || reuse {
 		// TODO: implement singleflight without  type conversion
 		laddrStr := laddr.String()
 		// We create or return existing
-		conn, err, _ := p.sf.Do(laddrStr+a, func() (any, error) {
+		result := p.sf.DoChan(laddrStr+a, func() (any, error) {
 			if laddr.Port > 0 {
 				if c := p.getUnref(laddrStr); c != nil {
 					return c, nil
@@ -119,12 +129,19 @@ func (p *connectionPool) addSingleflight(raddr Addr, laddr Addr, reuse bool, do 
 			p.m[c.LocalAddr().String()] = c
 			return c, nil
 		})
-		if err != nil {
-			return nil, err
+
+		select {
+		case res := <-result:
+			if res.Err != nil {
+				return nil, res.Err
+			}
+			c := res.Val.(Connection)
+			c.Ref(1)
+			return c, nil
+		case <-ctx.Done():
+			// Stop waiting without touching the shared creation.
+			return nil, fmt.Errorf("connection singleflight wait canceled: %w", ctx.Err())
 		}
-		c := conn.(Connection)
-		c.Ref(1)
-		return c, nil
 	}
 
 	// There is nothing here to block

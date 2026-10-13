@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hujm2023/sipgo/fakes"
 	"github.com/stretchr/testify/require"
 )
 
@@ -337,4 +338,63 @@ func TestIsProtectedReliable(t *testing.T) {
 	require.False(t, isProtectedReliable("UDP"))
 	require.False(t, isProtectedReliable("WS"))
 	require.False(t, isProtectedReliable("WSS"))
+}
+
+// TestConnectionPoolSingleflightWaitIsCancelable proves a caller that gives up
+// while sharing an in-flight connection creation does not block behind the
+// other caller's dial, and that the shared creation still finishes under its
+// own owner.
+func TestConnectionPoolSingleflightWaitIsCancelable(t *testing.T) {
+	pool := newConnectionPool()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	conn := &TCPConnection{Conn: &fakes.TCPConn{
+		LAddr: net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5061},
+		RAddr: net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5060},
+	}}
+
+	do := func() (Connection, error) {
+		close(started)
+		<-release
+		return conn, nil
+	}
+
+	raddr := Addr{IP: net.IPv4(127, 0, 0, 1), Port: 5060}
+	laddr := Addr{IP: net.IPv4(127, 0, 0, 1), Port: 5061}
+
+	type result struct {
+		conn Connection
+		err  error
+	}
+	first := make(chan result, 1)
+
+	go func() {
+		c, err := pool.addSingleflight(context.Background(), raddr, laddr, true, do)
+		first <- result{conn: c, err: err}
+	}()
+
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := pool.addSingleflight(ctx, raddr, laddr, true, do)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, elapsed, time.Second, "a canceled wait must not block behind the shared creation")
+
+	close(release)
+
+	select {
+	case res := <-first:
+		require.NoError(t, res.err)
+		require.NotNil(t, res.conn)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the owning caller never got the shared connection")
+	}
 }
