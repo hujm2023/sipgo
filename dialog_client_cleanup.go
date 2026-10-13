@@ -17,29 +17,34 @@ import (
 const lateCleanupQueueSize = 64
 
 // lateAnswerCleanup is a UA-owned protocol controller. Its fixed protocol
-// lifetime is separate from each dialog's product cleanup deadline. It freezes
-// request/client identity and never accesses the caller's session after handoff.
+// lifetime is separate from each dialog's product cleanup deadline. Non-2xx
+// retains Timer D; the first 2xx switches once to Timer M. Later duplicates or
+// forks never extend that stage. It freezes request/client identity and never
+// accesses the caller's session after handoff.
 type lateAnswerCleanup struct {
-	client        *Client
-	inviteRequest *sip.Request
-	sequence      atomic.Uint32
-	base          context.Context
-	timeout       time.Duration
-	invite        sip.ClientTransaction
-	queue         chan *sip.Response
-	ctx           context.Context
-	stop          context.CancelFunc
-	inputGone     chan struct{}
-	initialDone   chan struct{}
-	initialOnce   sync.Once
-	workerWG      sync.WaitGroup
-	tasksWG       sync.WaitGroup
-	mu            sync.Mutex
-	started       bool
-	closed        bool
-	views         map[string]*lateDialogView
-	errs          []error
-	initialID     string
+	client           *Client
+	inviteRequest    *sip.Request
+	sequence         atomic.Uint32
+	base             context.Context
+	timeout          time.Duration
+	invite           sip.ClientTransaction
+	queue            chan *sip.Response
+	ctx              context.Context
+	stop             context.CancelFunc
+	inputGone        chan struct{}
+	initialDone      chan struct{}
+	initialOnce      sync.Once
+	workerWG         sync.WaitGroup
+	tasksWG          sync.WaitGroup
+	mu               sync.Mutex
+	started          bool
+	closed           bool
+	views            map[string]*lateDialogView
+	errs             []error
+	initialID        string
+	protocolDeadline time.Time
+	sawSuccess       bool
+	phaseChanged     chan struct{}
 }
 
 type lateDialogView struct {
@@ -58,7 +63,7 @@ func newLateAnswerCleanup(session *DialogClientSession, base context.Context, ti
 	c := &lateAnswerCleanup{
 		client: session.UA.Client, inviteRequest: session.InviteRequest.Clone(),
 		base: base, timeout: timeout, queue: make(chan *sip.Response, lateCleanupQueueSize),
-		inputGone: make(chan struct{}), initialDone: make(chan struct{}), views: make(map[string]*lateDialogView),
+		phaseChanged: make(chan struct{}, 1), inputGone: make(chan struct{}), initialDone: make(chan struct{}), views: make(map[string]*lateDialogView),
 	}
 	c.sequence.Store(max(session.lastCSeqNo.Load(), c.inviteRequest.CSeq().SeqNo))
 	return c
@@ -77,7 +82,8 @@ func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
 		return
 	}
 	if !c.started {
-		c.ctx, c.stop = context.WithTimeout(c.base, max(sip.Timer_M, sip.Timer_D))
+		c.ctx, c.stop = context.WithCancel(c.base)
+		c.protocolDeadline = time.Now().Add(sip.Timer_D)
 		if !c.client.UserAgent.trackCleanup(c) {
 			c.stop()
 			c.closed = true
@@ -88,6 +94,14 @@ func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
 		c.started = true
 		c.workerWG.Add(1)
 		go c.worker()
+	}
+	if res.IsSuccess() && !c.sawSuccess {
+		c.sawSuccess = true
+		c.protocolDeadline = time.Now().Add(sip.Timer_M)
+		select {
+		case c.phaseChanged <- struct{}{}:
+		default:
+		}
 	}
 	c.mu.Unlock()
 	if !res.IsSuccess() {
@@ -143,6 +157,14 @@ func (c *lateAnswerCleanup) worker() {
 	defer func() {
 		c.closeInput()
 		c.tasksWG.Wait()
+		c.mu.Lock()
+		for _, view := range c.views {
+			if !view.byeSent() {
+				view.stop()
+				close(view.done)
+			}
+		}
+		c.mu.Unlock()
 		c.stop()
 		if c.invite != nil {
 			c.invite.Terminate()
@@ -151,8 +173,35 @@ func (c *lateAnswerCleanup) worker() {
 			c.client.log.Error("late answer protocol cleanup failed", "error", err)
 		}
 	}()
+	c.mu.Lock()
+	deadline := c.protocolDeadline
+	c.mu.Unlock()
+	protocolTimer := time.NewTimer(time.Until(deadline))
+	defer protocolTimer.Stop()
+	var inviteDone <-chan struct{}
+	if c.invite != nil {
+		inviteDone = c.invite.Done()
+	}
 	for {
 		select {
+		case <-c.phaseChanged:
+			c.mu.Lock()
+			deadline = c.protocolDeadline
+			c.mu.Unlock()
+			protocolTimer.Reset(time.Until(deadline))
+		case <-protocolTimer.C:
+			c.mu.Lock()
+			deadline = c.protocolDeadline
+			c.mu.Unlock()
+			if time.Now().Before(deadline) {
+				protocolTimer.Reset(time.Until(deadline))
+				continue
+			}
+			c.stop()
+			return
+		case <-inviteDone:
+			c.stop()
+			return
 		case res := <-c.queue:
 			c.handle(res)
 		case <-c.ctx.Done():
@@ -190,12 +239,15 @@ func (c *lateAnswerCleanup) handle(res *sip.Response) {
 	if err := c.sendAck(ackCtx, res); err != nil {
 		if retryErr := c.sendAck(ackCtx, res); retryErr != nil {
 			c.recordError(fmt.Errorf("late 2xx ACK failed for dialog %q: %w", view.id, errors.Join(err, retryErr)))
+			// Product cleanup is unknown; a later retransmit may succeed, but cannot
+			// authorize BYE unless this same original dialog budget still has time.
+			if view.initial {
+				c.initialOnce.Do(func() { close(c.initialDone) })
+			}
+			return
 		}
 	}
-
-	if created {
-		c.startByeTask(view, res)
-	}
+	c.startByeTask(view, res)
 }
 
 func (c *lateAnswerCleanup) dialogView(res *sip.Response) (*lateDialogView, bool) {
@@ -224,6 +276,11 @@ func (c *lateAnswerCleanup) dialogView(res *sip.Response) (*lateDialogView, bool
 }
 
 func (c *lateAnswerCleanup) sendAck(ctx context.Context, res *sip.Response) error {
+	c.mu.Lock()
+	deadline := c.protocolDeadline
+	c.mu.Unlock()
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	ack := newAckRequestUAC(c.inviteRequest, res, nil)
 	applyDialogRouteSet(ack, res)
 
@@ -253,7 +310,7 @@ func (c *lateAnswerCleanup) viewOf(res *sip.Response) (*lateDialogView, bool) {
 // by the controller (tracked in tasksWG), then joined by its UA at shutdown.
 func (c *lateAnswerCleanup) startByeTask(view *lateDialogView, res *sip.Response) {
 	view.mu.Lock()
-	if view.byeStarted {
+	if view.byeStarted || view.ctx.Err() != nil {
 		view.mu.Unlock()
 		return
 	}

@@ -275,8 +275,9 @@ func (tx *ClientTx) delete(err error) bool {
 }
 
 // RetainInviteResponses opts an explicitly canceled INVITE into a protocol
-// response owner. Reliable non-2xx finals retain a fixed Timer_M window for
-// forked 2xx; legacy callers and all protocol timer defaults are unchanged.
+// response owner. Reliable non-2xx finals retain fixed Timer_D; the
+// first forked 2xx transitions once to its independent Timer_M. Legacy callers
+// and all protocol timer defaults are unchanged.
 func (tx *ClientTx) RetainInviteResponses() bool {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
@@ -284,6 +285,6 @@ func (tx *ClientTx) RetainInviteResponses() bool {
 		return false
 	}
 	tx.retainInviteResponses = true
-	tx.timer_d_time = max(tx.timer_d_time, Timer_M)
+	tx.timer_d_time = max(tx.timer_d_time, Timer_D)
 	return true
 }
