@@ -1,6 +1,7 @@
 package sip
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -34,9 +35,21 @@ func NewClientTx(key string, origin *Request, conn Connection, logger *slog.Logg
 }
 
 func (tx *ClientTx) Init() error {
+	return tx.init(nil)
+}
+
+// InitContext is Init with a caller context: the initial request write is
+// bounded by ctx and, when the connection carries a reliable write budget, by
+// the earlier of both. The context is not retained by the transaction, so it
+// never bounds later automatic retransmissions.
+func (tx *ClientTx) InitContext(ctx context.Context) error {
+	return tx.init(ctx)
+}
+
+func (tx *ClientTx) init(ctx context.Context) error {
 	tx.initFSM()
 
-	if err := tx.conn.WriteMsg(tx.origin); err != nil {
+	if err := tx.writeMsgOnConn(ctx, tx.origin); err != nil {
 		e := fmt.Errorf("fail to write request on init req=%q: %w", tx.origin.StartLine(), err)
 		return wrapTransportError(e)
 	}

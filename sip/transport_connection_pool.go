@@ -2,6 +2,7 @@ package sip
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -21,6 +22,41 @@ type Connection interface {
 
 	Close() error
 }
+
+// ContextWriter is an optional capability implemented by connections that can
+// bound a single message write with a caller context.
+//
+// The required Connection method set is intentionally left untouched so custom
+// connection implementations keep compiling; callers must type-assert to
+// ContextWriter before relying on a bounded write.
+//
+// Implementations must honor this contract:
+//   - giving up while the write is still queued must not touch the socket;
+//   - once the write has actually started, an expired context must really
+//     unblock the underlying write (hard-closing that exact connection is
+//     allowed) and the call must only return after that write returned.
+type ContextWriter interface {
+	WriteMsgContext(ctx context.Context, msg Message) error
+}
+
+var (
+	// ErrWriteCanceled is returned when a write was abandoned before it
+	// started, either while waiting for the connection write queue or because
+	// the context was already done. The connection is left untouched.
+	ErrWriteCanceled = errors.New("connection write canceled before start")
+
+	// ErrWriteStalled is returned when a write had already started and did not
+	// return before the budget/context expired. The exact connection was
+	// hard-closed to unblock it, so the message may be partially sent and the
+	// connection must not be reused.
+	ErrWriteStalled = errors.New("connection write stalled")
+
+	// ErrWriteNotCancelable is returned by context-aware transports when a
+	// connection that cannot honor a context is asked for a bounded write on a
+	// protected reliable transport (TCP/TLS). It prevents silently degrading a
+	// requested budget into an unbounded write.
+	ErrWriteNotCancelable = errors.New("connection does not support context writes")
+)
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
@@ -195,4 +231,16 @@ func (p *connectionPool) Size() int {
 	l := len(p.m)
 	p.RUnlock()
 	return l
+}
+
+// all returns a snapshot of pooled connections. Used by transport owners that
+// need to apply a connection-level setting to already established connections.
+func (p *connectionPool) all() []Connection {
+	p.RLock()
+	defer p.RUnlock()
+	conns := make([]Connection, 0, len(p.m))
+	for _, c := range p.m {
+		conns = append(conns, c)
+	}
+	return conns
 }

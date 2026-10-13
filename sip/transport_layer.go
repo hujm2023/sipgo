@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,6 +42,11 @@ type TransportLayer struct {
 	// connectionReuse will force connection reuse when passing request
 	connectionReuse bool
 	readFilter      TransportReadFilter
+
+	// reliableWriteTimeout is the reliable write budget installed on TCP/TLS
+	// connections of this layer (both outbound and inbound). Zero keeps the
+	// legacy unbounded writes.
+	reliableWriteTimeout time.Duration
 
 	// dnsPreferSRV does always SRV lookup first
 	dnsPreferSRV bool
@@ -174,7 +180,21 @@ func NewTransportLayer(
 	l.ws.init(sipparser)
 	l.wss.init(sipparser, tlsConfig)
 
+	l.applyReliableWriteTimeout()
+
 	return l
+}
+
+// applyReliableWriteTimeout pushes the layer write budget into the reliable
+// transports. It runs after every transport has been initialized so the
+// setting also reaches transports injected with WithTransportLayerTransports.
+func (l *TransportLayer) applyReliableWriteTimeout() {
+	if l.tcp != nil {
+		l.tcp.applyWriteTimeout(l.reliableWriteTimeout)
+	}
+	if l.tls != nil {
+		l.tls.applyWriteTimeout(l.reliableWriteTimeout)
+	}
 }
 
 func (l *TransportLayer) withTransports(conf TransportsConfig) {
@@ -340,6 +360,29 @@ func (l *TransportLayer) WriteMsg(msg Message) error {
 }
 
 func (l *TransportLayer) WriteMsgTo(msg Message, addr string, network string) error {
+	return l.writeMsgTo(context.Background(), msg, addr, network, false)
+}
+
+// WriteMsgContext is WriteMsg with a caller context and the incremental entry
+// point for bounded writes.
+//
+// On the protected reliable transports (TCP, TLS) the write is bounded by ctx:
+// while the write is queued for the connection, ctx expiry returns without
+// touching a healthy connection; once the write actually started, ctx expiry
+// hard-closes that exact connection so the blocked write returns, and the call
+// only returns after it did.
+//
+// UDP and the WebSocket transports keep their legacy behavior. Callers that
+// enabled the reliable-write protection get a loud ErrWriteNotCancelable
+// instead of an unbounded write when a connection cannot honor ctx.
+func (l *TransportLayer) WriteMsgContext(ctx context.Context, msg Message) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return l.writeMsgTo(ctx, msg, msg.Destination(), msg.Transport(), true)
+}
+
+func (l *TransportLayer) writeMsgTo(ctx context.Context, msg Message, addr string, network string, bounded bool) error {
 	/*s
 	// Client sending request, or we are sending responses
 	To consider
@@ -367,7 +410,6 @@ func (l *TransportLayer) WriteMsgTo(msg Message, addr string, network string) er
 	//    one indicated in the top Via, the value in the top Via MUST be
 	//    changed.
 	case *Request:
-		var ctx = context.Background()
 		//Every new request must be handled in seperate connection
 		conn, err = l.ClientRequestConnection(ctx, m)
 		if err != nil {
@@ -387,11 +429,38 @@ func (l *TransportLayer) WriteMsgTo(msg Message, addr string, network string) er
 		defer conn.TryClose()
 	}
 
+	if bounded {
+		return l.writeConnMessage(ctx, conn, msg, network)
+	}
+
 	if err := conn.WriteMsg(msg); err != nil {
 		return err
 	}
 
 	return err
+}
+
+// writeConnMessage writes an explicitly bounded message. Connections that do
+// not implement ContextWriter are only accepted when the layer has no reliable
+// write protection installed; otherwise the caller gets a loud error instead of
+// a silently unbounded write.
+func (l *TransportLayer) writeConnMessage(ctx context.Context, conn Connection, msg Message, network string) error {
+	if cw, ok := conn.(ContextWriter); ok {
+		return cw.WriteMsgContext(ctx, msg)
+	}
+
+	if l.reliableWriteTimeout > 0 && isProtectedReliable(network) {
+		return fmt.Errorf("%w on %s (conn %T)", ErrWriteNotCancelable, network, conn)
+	}
+
+	return conn.WriteMsg(msg)
+}
+
+// isProtectedReliable reports whether the network is one of the reliable stream
+// transports covered by the connection write budget. UDP and WS/WSS are not.
+func isProtectedReliable(network string) bool {
+	n := NetworkToLower(network)
+	return strings.HasPrefix(n, "tcp") || strings.HasPrefix(n, "tls")
 }
 
 // ClientRequestConnection is based on

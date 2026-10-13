@@ -305,7 +305,9 @@ func (txl *TransactionLayer) Request(ctx context.Context, req *Request) (*Client
 		return nil, err
 	}
 
-	if err := tx.Init(); err != nil {
+	// The initial request write inherits the caller context so the submission
+	// itself is bounded, not only the connection creation.
+	if err := tx.InitContext(ctx); err != nil {
 		tx.Terminate()
 		return nil, err
 	}

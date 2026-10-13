@@ -199,7 +199,7 @@ func (c *Client) newTransaction(ctx context.Context, req *sip.Request, onConnect
 		return nil, err
 	}
 
-	err = tx.Init()
+	err = tx.InitContext(ctx)
 	if err != nil {
 		tx.Terminate()
 	}
@@ -302,9 +302,24 @@ func (c *Client) digestTransactionRequest(ctx context.Context, req *sip.Request,
 // Behavior is same as TransactionRequest
 // Non-transaction ACK request should be passed like this
 func (c *Client) WriteRequest(req *sip.Request, options ...ClientRequestOption) error {
+	return c.writeRequest(context.Background(), req, options...)
+}
+
+// WriteRequestContext is WriteRequest with a caller context. On TCP/TLS the
+// write honors ctx: while queued it returns without touching a healthy
+// connection, and once the write started ctx expiry unblocks it (hard-closing
+// that exact connection) before returning.
+func (c *Client) WriteRequestContext(ctx context.Context, req *sip.Request, options ...ClientRequestOption) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.writeRequest(ctx, req, options...)
+}
+
+func (c *Client) writeRequest(ctx context.Context, req *sip.Request, options ...ClientRequestOption) error {
 	if len(options) == 0 {
 		clientRequestBuildReq(c, req)
-		return c.writeReq(req)
+		return c.writeReq(ctx, req)
 	}
 
 	for _, o := range options {
@@ -312,15 +327,15 @@ func (c *Client) WriteRequest(req *sip.Request, options ...ClientRequestOption) 
 			return err
 		}
 	}
-	return c.writeReq(req)
+	return c.writeReq(ctx, req)
 }
 
-func (c *Client) writeReq(req *sip.Request) error {
+func (c *Client) writeReq(ctx context.Context, req *sip.Request) error {
 	if c.TxRequester != nil {
-		_, err := c.TxRequester.Request(context.TODO(), req)
+		_, err := c.TxRequester.Request(ctx, req)
 		return err
 	}
-	return c.tp.WriteMsg(req)
+	return c.tp.WriteMsgContext(ctx, req)
 }
 
 type ClientRequestOption func(c *Client, req *sip.Request) error

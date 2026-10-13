@@ -82,6 +82,14 @@ func (s *DialogClientSession) WriteRequest(req *sip.Request) error {
 	return s.UA.Client.WriteRequest(req, s.requestValidate)
 }
 
+// WriteRequestContext is WriteRequest with a caller context. It is the in-dialog
+// entry point for ACK/BYE and any other subsequent request that must respect a
+// real write budget; on TCP/TLS the write honors ctx.
+func (s *DialogClientSession) WriteRequestContext(ctx context.Context, req *sip.Request) error {
+	s.buildReq(req)
+	return s.UA.Client.WriteRequestContext(ctx, req, s.requestValidate)
+}
+
 func (s *DialogClientSession) requestValidate(c *Client, req *sip.Request) error {
 	if req.Via() == nil {
 		ClientRequestAddVia(c, req)
@@ -426,7 +434,7 @@ func (s *DialogClientSession) WriteAck(ctx context.Context, ack *sip.Request) er
 		}
 	})
 
-	if err := s.WriteRequest(ack); err != nil {
+	if err := s.WriteRequestContext(ctx, ack); err != nil {
 		// Make sure we close our error
 		// s.Close()
 		return err
