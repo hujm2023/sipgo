@@ -189,21 +189,7 @@ func (c *Client) newTransaction(ctx context.Context, req *sip.Request, onConnect
 		return c.TxRequester.Request(ctx, req)
 	}
 
-	tx, err := c.tx.NewClientTransaction(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := onConnection(tx.Connection()); err != nil {
-		tx.Terminate()
-		return nil, err
-	}
-
-	err = tx.InitContext(ctx)
-	if err != nil {
-		tx.Terminate()
-	}
-	return tx, err
+	return c.tx.RequestWithConnection(ctx, req, onConnection)
 }
 
 // Do request is HTTP client like Do request/response.

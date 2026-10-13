@@ -38,8 +38,7 @@ func (t *TransportTLS) String() string {
 
 // CreateConnection creates TLS connection for TCP transport
 func (t *TransportTLS) CreateConnection(ctx context.Context, laddr Addr, raddr Addr, handler MessageHandler) (Connection, error) {
-	isNew := false
-	conn, err := t.pool.addSingleflight(ctx, raddr, laddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflightRead(ctx, raddr, laddr, t.connectionReuse, func(ctx context.Context) (Connection, error) {
 		hostname := raddr.Hostname
 		if hostname == "" {
 			hostname = raddr.IP.String()
@@ -77,15 +76,14 @@ func (t *TransportTLS) CreateConnection(ctx context.Context, laddr Addr, raddr A
 
 		t.log.Debug("New connection", "raddr", raddr)
 		c := t.newConnection(tlsConn, 2+TransportIdleConnection)
-		isNew = true
 		return c, nil
+	}, func(conn Connection) {
+		c := conn.(*TCPConnection)
+		t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 	})
 	if err != nil {
 		return nil, err
 	}
 	c := conn.(*TCPConnection)
-	if isNew {
-		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
-	}
 	return c, nil
 }

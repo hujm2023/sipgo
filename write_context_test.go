@@ -578,7 +578,7 @@ func TestReliableSubmitBudgetBoundsTLSHandshake(t *testing.T) {
 
 // A submit gets one budget, not a fresh write budget after TLS establishment.
 func TestReliableSubmitBudgetIsSharedByHandshakeAndWrite(t *testing.T) {
-	for _, mode := range []string{"transaction", "legacy transport"} {
+	for _, mode := range []string{"transaction", "legacy transport", "dialog Contact0"} {
 		t.Run(mode, func(t *testing.T) {
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
@@ -618,6 +618,11 @@ func TestReliableSubmitBudgetIsSharedByHandshakeAndWrite(t *testing.T) {
 				if err == nil {
 					tx.Terminate()
 				}
+			} else if mode == "dialog Contact0" {
+				req.Method = sip.INVITE
+				req.CSeq().MethodName = sip.INVITE
+				dialog := DialogUA{Client: cli, ContactHDR: sip.ContactHeader{Address: sip.Uri{Host: "127.0.0.1", Port: 0}}}
+				_, err = dialog.WriteInvite(context.Background(), req)
 			} else {
 				err = ua.tp.WriteMsg(req)
 			}

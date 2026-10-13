@@ -73,8 +73,15 @@ var bufPool = sync.Pool{
 type connectionPool struct {
 	// TODO consider sync.Map way with atomic checks to reduce mutex contention
 	sync.RWMutex
-	m  map[string]Connection
-	sf singleflight.Group
+	m               map[string]Connection
+	sf              singleflight.Group
+	closed          bool
+	creating        sync.WaitGroup
+	reading         sync.WaitGroup
+	nextCreation    uint64
+	cancelCreations map[uint64]context.CancelFunc
+	nextReader      uint64
+	readers         map[uint64]Connection
 }
 
 func newConnectionPool() *connectionPool {
@@ -85,6 +92,8 @@ func newConnectionPool() *connectionPool {
 
 func (p *connectionPool) init() {
 	p.m = make(map[string]Connection)
+	p.cancelCreations = make(map[uint64]context.CancelFunc)
+	p.readers = make(map[uint64]Connection)
 }
 
 // addSingleflight returns an existing connection or shares one in-flight
@@ -97,65 +106,107 @@ func (p *connectionPool) init() {
 // anymore, so an abandoned wait never leaves an unowned dial or a leaked
 // connection.
 func (p *connectionPool) addSingleflight(ctx context.Context, raddr Addr, laddr Addr, reuse bool, do func() (Connection, error)) (Connection, error) {
+	return p.addSingleflightRead(ctx, raddr, laddr, reuse, func(context.Context) (Connection, error) { return do() }, nil)
+}
+
+// addSingleflightRead makes TCP/TLS establishment and the successful reader the
+// pool's responsibility. A waiter may leave without abandoning either owner.
+// Publication and reader registration are atomic with Clear closing admission.
+func (p *connectionPool) addSingleflightRead(ctx context.Context, raddr Addr, laddr Addr, reuse bool, do func(context.Context) (Connection, error), read func(Connection)) (Connection, error) {
 	a := raddr.String()
-
-	if laddr.Port > 0 || reuse {
-		// TODO: implement singleflight without  type conversion
-		laddrStr := laddr.String()
-		// We create or return existing
-		result := p.sf.DoChan(laddrStr+a, func() (any, error) {
-			if laddr.Port > 0 {
-				if c := p.getUnref(laddrStr); c != nil {
-					return c, nil
-				}
-			} else {
-				if c := p.getUnref(a); c != nil {
-					return c, nil
-				}
-			}
-
-			c, err := do()
-			if err != nil {
-				return nil, err
-			}
-			// Decrease reference as it will be increased after
-			// Singleflight will return cached so we need todo this
-			c.Ref(-1)
-
-			p.Lock()
-			defer p.Unlock()
-
-			p.m[a] = c
-			p.m[c.LocalAddr().String()] = c
-			return c, nil
-		})
-
-		select {
-		case res := <-result:
-			if res.Err != nil {
-				return nil, res.Err
-			}
-			c := res.Val.(Connection)
-			c.Ref(1)
-			return c, nil
-		case <-ctx.Done():
-			// Stop waiting without touching the shared creation.
-			return nil, fmt.Errorf("connection singleflight wait canceled: %w", ctx.Err())
+	shared := laddr.Port > 0 || reuse
+	create := func() (Connection, error) {
+		p.Lock()
+		if p.closed {
+			p.Unlock()
+			return nil, net.ErrClosed
 		}
+		var creationID uint64
+		createCtx := ctx
+		if read != nil {
+			var cancel context.CancelFunc
+			createCtx, cancel = context.WithCancel(ctx)
+			p.nextCreation++
+			creationID = p.nextCreation
+			p.cancelCreations[creationID] = cancel
+			p.creating.Add(1)
+		}
+		p.Unlock()
+		if read != nil {
+			defer func() {
+				p.Lock()
+				cancel := p.cancelCreations[creationID]
+				delete(p.cancelCreations, creationID)
+				p.Unlock()
+				cancel()
+				p.creating.Done()
+			}()
+		}
+		c, err := do(createCtx)
+		if err != nil {
+			return nil, err
+		}
+		if shared {
+			c.Ref(-1)
+		} else if c.Ref(0) < 1 {
+			c.Ref(1)
+		}
+		if err := p.publishRead(c, a, read); err != nil {
+			return nil, err
+		}
+		return c, nil
 	}
+	if !shared {
+		return create()
+	}
+	key := laddr.String() + a
+	result := p.sf.DoChan(key, func() (any, error) {
+		var cached Connection
+		if laddr.Port > 0 {
+			cached = p.getUnref(laddr.String())
+		} else {
+			cached = p.getUnref(a)
+		}
+		if cached != nil {
+			return cached, nil
+		}
+		return create()
+	})
+	select {
+	case res := <-result:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		c := res.Val.(Connection)
+		c.Ref(1)
+		return c, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("connection singleflight wait canceled: %w", ctx.Err())
+	}
+}
 
-	// There is nothing here to block
-	c, err := do()
-	if err != nil {
-		return nil, err
+func (p *connectionPool) publishRead(c Connection, addr string, read func(Connection)) error {
+	p.Lock()
+	if p.closed {
+		p.Unlock()
+		_ = c.Close()
+		return net.ErrClosed
 	}
-
-	if c.Ref(0) < 1 {
-		c.Ref(1) // Make 1 reference count by default
-	}
-	p.m[a] = c
+	p.m[addr] = c
 	p.m[c.LocalAddr().String()] = c
-	return c, nil
+	if read != nil {
+		p.nextReader++
+		readerID := p.nextReader
+		p.readers[readerID] = c
+		p.reading.Add(1)
+		go func() {
+			defer p.reading.Done()
+			defer func() { p.Lock(); delete(p.readers, readerID); p.Unlock() }()
+			read(c)
+		}()
+	}
+	p.Unlock()
+	return nil
 }
 
 func (p *connectionPool) Add(a string, c Connection) {
@@ -166,6 +217,11 @@ func (p *connectionPool) Add(a string, c Connection) {
 		c.Ref(1) // Make 1 reference count by default
 	}
 	p.Lock()
+	if p.closed {
+		p.Unlock()
+		_ = c.Close()
+		return
+	}
 	p.m[a] = c
 	p.Unlock()
 }
@@ -190,6 +246,9 @@ func (p *connectionPool) Get(a string) (c Connection) {
 func (p *connectionPool) getUnref(a string) (c Connection) {
 	p.RLock()
 	c, exists := p.m[a]
+	if p.closed {
+		exists = false
+	}
 	p.RUnlock()
 	if !exists {
 		return nil
@@ -226,21 +285,40 @@ func (p *connectionPool) DeleteMultiple(addrs []string) {
 // Clear will clear all connection from pool and close them
 func (p *connectionPool) Clear() error {
 	p.Lock()
-	defer p.Unlock()
-
-	defer func() {
-		// Remove all
-		p.m = make(map[string]Connection)
-	}()
-
-	var werr error
-	for _, c := range p.m {
-		if c.Ref(0) <= 0 {
-			continue
-		}
-		werr = errors.Join(werr, c.Close())
+	p.closed = true
+	cancels := make([]context.CancelFunc, 0, len(p.cancelCreations))
+	for _, cancel := range p.cancelCreations {
+		cancels = append(cancels, cancel)
 	}
-	return werr
+	owned := make([]Connection, 0, len(p.readers))
+	for _, c := range p.readers {
+		owned = append(owned, c)
+	}
+	conns := make([]Connection, 0, len(p.m))
+	for _, c := range p.m {
+		conns = append(conns, c)
+	}
+	p.m = make(map[string]Connection)
+	p.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	var err error
+	// A reader owns its socket even if every address alias was replaced/deleted.
+	// Close these sockets first; cached aliases then observe the dropped refcount.
+	for _, c := range owned {
+		if e := c.Close(); e != nil && !errors.Is(e, net.ErrClosed) {
+			err = errors.Join(err, e)
+		}
+	}
+	for _, c := range conns {
+		if c.Ref(0) > 0 {
+			err = errors.Join(err, c.Close())
+		}
+	}
+	p.creating.Wait()
+	p.reading.Wait()
+	return err
 }
 
 func (p *connectionPool) Size() int {

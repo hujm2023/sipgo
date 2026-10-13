@@ -300,6 +300,13 @@ func (txl *TransactionLayer) handleResponse(res *Response) error {
 }
 
 func (txl *TransactionLayer) Request(ctx context.Context, req *Request) (*ClientTx, error) {
+	return txl.RequestWithConnection(ctx, req, nil)
+}
+
+// RequestWithConnection prepares connection-dependent headers before submitting
+// the request. Establishment, this synchronous callback and Init share the same
+// earlier reliable submit deadline; failed preparation releases the transaction.
+func (txl *TransactionLayer) RequestWithConnection(ctx context.Context, req *Request, prepare func(Connection) error) (*ClientTx, error) {
 	ctx, cancel := txl.tpl.reliableSubmitContext(ctx, req.Transport())
 	defer cancel()
 	tx, err := txl.NewClientTransaction(ctx, req)
@@ -307,6 +314,12 @@ func (txl *TransactionLayer) Request(ctx context.Context, req *Request) (*Client
 		return nil, err
 	}
 
+	if prepare != nil {
+		if err := prepare(tx.Connection()); err != nil {
+			tx.Terminate()
+			return nil, err
+		}
+	}
 	// The initial request write inherits the caller context so the submission
 	// itself is bounded, not only the connection creation.
 	if err := tx.InitContext(ctx); err != nil {

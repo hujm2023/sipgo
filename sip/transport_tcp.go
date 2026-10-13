@@ -119,7 +119,7 @@ func (t *TransportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr A
 	// 	return nil, err
 	// }
 	// We do singleflight if laddr is required or connection reuse
-	conn, err := t.pool.addSingleflight(ctx, raddr, laddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflightRead(ctx, raddr, laddr, t.connectionReuse, func(ctx context.Context) (Connection, error) {
 		var tladdr *net.TCPAddr = nil
 		if laddr.IP != nil {
 			tladdr = &net.TCPAddr{
@@ -154,8 +154,10 @@ func (t *TransportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr A
 		t.log.Debug("New connection", "raddr", raddr)
 		c := t.newConnection(conn, 2+TransportIdleConnection) // 1 returning + 1 reading + Idle
 
-		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 		return c, nil
+	}, func(conn Connection) {
+		c := conn.(*TCPConnection)
+		t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
 	})
 	if err != nil {
 		return nil, err
@@ -171,9 +173,9 @@ func (t *TransportTCP) initConnection(conn net.Conn, raddr string, handler Messa
 	laddr := conn.LocalAddr().String()
 	t.log.Debug("New connection", "raddr", raddr)
 	c := t.newConnection(conn, 1+TransportIdleConnection)
-	t.pool.Add(laddr, c)
-	t.pool.Add(raddr, c)
-	go t.readConnection(c, laddr, raddr, handler)
+	if err := t.pool.publishRead(c, raddr, func(conn Connection) { t.readConnection(conn.(*TCPConnection), laddr, raddr, handler) }); err != nil {
+		return nil
+	}
 	return c
 }
 
