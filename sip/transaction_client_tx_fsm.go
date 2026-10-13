@@ -68,6 +68,14 @@ func (tx *ClientTx) inviteStateProcceeding(s fsmInput) fsmInput {
 func (tx *ClientTx) inviteStateCompleted(s fsmInput) fsmInput {
 	var spinfn fsmState
 	switch s {
+	case client_input_2xx:
+		tx.mu.Lock()
+		retained := tx.retainInviteResponses
+		tx.mu.Unlock()
+		if !retained {
+			return FsmInputNone
+		}
+		tx.fsmState, spinfn = tx.inviteStateCompleted, tx.actPassupRetransmission
 	case client_input_300_plus:
 		tx.fsmState, spinfn = tx.inviteStateCompleted, tx.actAckResend
 	case client_input_transport_err:

@@ -300,6 +300,8 @@ func (txl *TransactionLayer) handleResponse(res *Response) error {
 }
 
 func (txl *TransactionLayer) Request(ctx context.Context, req *Request) (*ClientTx, error) {
+	ctx, cancel := txl.tpl.reliableSubmitContext(ctx, req.Transport())
+	defer cancel()
 	tx, err := txl.NewClientTransaction(ctx, req)
 	if err != nil {
 		return nil, err

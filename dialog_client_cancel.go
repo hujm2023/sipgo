@@ -16,8 +16,8 @@ import (
 //
 // The three timeouts are independent on purpose: the CANCEL request has its own
 // transaction and consumer, the original INVITE keeps its own fixed
-// final-response deadline, and the protocol cleanup triggered by a late answer
-// has its own budget. None of them may extend another.
+// final-response deadline, and each late dialog has its own product cleanup
+// budget. The separate UA-owned protocol window is never extended by them.
 //
 // Every field must be positive. WaitAnswerWithCancel rejects an invalid policy
 // instead of authorizing an unowned exit of an existing transaction; there is
@@ -35,9 +35,10 @@ type InviteCancelPolicy struct {
 	// VoIPGo passes sip.Timer_B.
 	FinalResponseTimeout time.Duration
 
-	// CleanupTimeout is shared by the protocol duties the cancel path owns once
-	// a final response arrives (a late/duplicate 2xx still needs its ACK and, at
-	// most, one logical BYE per real dialog).
+	// CleanupTimeout bounds one dialog's initial ACK, retry and logical BYE.
+	// Duplicates never refresh that deadline. Later retransmissions still get
+	// bounded ACKs under the separate UA-owned protocol window; a new To-tag
+	// creates a new dialog with its own cleanup deadline.
 	// VoIPGo passes 5s.
 	CleanupTimeout time.Duration
 }
@@ -64,12 +65,14 @@ func (p InviteCancelPolicy) validate() error {
 //     that repeated 1xx responses can not extend;
 //   - creates at most one CANCEL, only after a provisional and before any final
 //     response, with its own transaction, consumer and deadline;
-//   - joins both consumers and releases the INVITE transaction before returning.
+//   - joins both consumers and initial dialog cleanup, then hands the remaining
+//     fixed protocol window to its UA owner (joined by UserAgent.Close).
 //
 // Normal answers are unchanged: the same states, `ErrDialogResponse` for a
 // non-2xx and the same observer callback. On cancellation the returned error
 // still matches ctx (`context.Canceled`/`context.DeadlineExceeded`) and is
-// joined with any CANCEL/cleanup error. `Close` keeps meaning local cleanup
+// joined with any CANCEL/initial-cleanup error. Later protocol failures remain
+// owned and logged by the UA. `Close` keeps meaning local cleanup
 // only and never sends BYE or CANCEL.
 func (s *DialogClientSession) WaitAnswerWithCancel(ctx context.Context, answer AnswerOptions, policy InviteCancelPolicy) error {
 	if err := policy.validate(); err != nil {
@@ -86,8 +89,8 @@ func (s *DialogClientSession) WaitAnswerWithCancel(ctx context.Context, answer A
 //
 // It runs exactly two consumers - one for the CANCEL it creates and one for the
 // original INVITE - under independent deadlines, joins both and only then
-// returns, so the caller never releases its fence while a signaling task is
-// still running without an owner.
+// returns. Initial product cleanup is joined; subsequent protocol work has
+// the explicit UA owner, which is joined during UA shutdown.
 type inviteTeardown struct {
 	session *DialogClientSession
 	policy  InviteCancelPolicy
@@ -101,7 +104,7 @@ type inviteTeardown struct {
 	cancelStop  context.CancelFunc
 
 	// cleanup owns every protocol duty triggered by a late/duplicate 2xx. It
-	// starts lazily and is joined before the teardown returns.
+	// starts lazily, freezes the request identity and is registered with the UA.
 	cleanup *lateAnswerCleanup
 
 	wg sync.WaitGroup
@@ -143,6 +146,10 @@ func (t *inviteTeardown) run(ctx context.Context) error {
 	defer t.cancelStop()
 
 	t.cleanup = newLateAnswerCleanup(t.session, base, t.policy.CleanupTimeout)
+	t.cleanup.invite = t.invite
+	if retained, ok := t.invite.(interface{ RetainInviteResponses() bool }); ok {
+		retained.RetainInviteResponses()
+	}
 
 	// Duplicated 2xx responses are only reported through the transaction
 	// retransmission notification, and each of them still needs its ACK. The
@@ -166,19 +173,22 @@ func (t *inviteTeardown) run(ctx context.Context) error {
 	// Independent consumers: the INVITE keeps being consumed until its own
 	// final response or the deadline fixed when the teardown started.
 	t.wg.Wait()
-	t.cleanup.closeInput()
 
 	if res := t.lastFinalResponse(); res != nil {
 		t.session.InviteResponse = res
 	}
 
-	// The protocol cleanup owns its own budget and is joined here, so the caller
-	// never releases its fence while an ACK/BYE task is still running. The INVITE
-	// transaction stays alive until then: responses already matched by the
-	// transaction layer must still be able to reach the cleanup and get their
-	// ACK instead of being dropped while the cleanup drains.
-	cleanupErr := t.cleanup.join()
-	t.invite.Terminate()
+	// Join the initial dialog's product cleanup. The registered UA owner keeps
+	// the INVITE through its separate fixed protocol window; returning here does
+	// not unregister retransmissions or let a new fork escape ACK/BYE duties.
+	cleanupErr := t.cleanup.completeInitial()
+	t.cleanup.mu.Lock()
+	handedOff := t.cleanup.started
+	t.cleanup.mu.Unlock()
+	if !handedOff {
+		_ = t.cleanup.join()
+		t.invite.Terminate()
+	}
 
 	return errors.Join(ctx.Err(), cancelErr, t.inviteError(), t.observerError(), cleanupErr)
 }

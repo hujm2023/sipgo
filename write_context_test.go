@@ -3,6 +3,7 @@ package sipgo
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -404,7 +405,9 @@ type recordingConn struct {
 	msgs []sip.Message
 }
 
-func (c *recordingConn) LocalAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5060} }
+func (c *recordingConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5060}
+}
 func (c *recordingConn) WriteMsg(msg sip.Message) error {
 	c.mu.Lock()
 	c.msgs = append(c.msgs, msg)
@@ -508,4 +511,118 @@ func TestServerWriteResponseContextUsesLegacyPathWithoutBudget(t *testing.T) {
 	err = srv.WriteResponseContext(context.Background(), res)
 	require.Error(t, err)
 	require.False(t, errors.Is(err, sip.ErrWriteNotCancelable))
+}
+
+// The submit budget covers establishing TLS, even before a writer exists.
+func TestReliableSubmitBudgetBoundsTLSHandshake(t *testing.T) {
+	for _, mode := range []string{"transaction", "client write", "transport write"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, tc := range []struct {
+				name           string
+				budget, parent time.Duration
+			}{
+				{"UA deadline", 60 * time.Millisecond, 600 * time.Millisecond},
+				{"earlier caller", 600 * time.Millisecond, 60 * time.Millisecond},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ln, err := net.Listen("tcp", "127.0.0.1:0")
+					require.NoError(t, err)
+					defer ln.Close()
+					peerDone := make(chan error, 1)
+					go func() {
+						c, e := ln.Accept()
+						if e != nil {
+							peerDone <- e
+							return
+						}
+						defer c.Close()
+						_, e = io.Copy(io.Discard, c)
+						peerDone <- e
+					}()
+					ua, err := NewUA(WithUserAgentReliableWriteTimeout(tc.budget), WithUserAgenTLSConfig(&tls.Config{InsecureSkipVerify: true}))
+					require.NoError(t, err)
+					defer ua.Close()
+					cli, err := NewClient(ua)
+					require.NoError(t, err)
+					req := buildTCPRequest(t, ln.Addr().String(), nil)
+					req.SetTransport("TLS")
+					ctx, cancel := context.WithTimeout(context.Background(), tc.parent)
+					defer cancel()
+					start := time.Now()
+					switch mode {
+					case "transaction":
+						var tx sip.ClientTransaction
+						tx, err = cli.TransactionRequest(ctx, req)
+						if err == nil {
+							tx.Terminate()
+						}
+					case "client write":
+						err = cli.WriteRequestContext(ctx, req)
+					case "transport write":
+						require.NoError(t, clientRequestBuildReq(cli, req))
+						err = ua.tp.WriteMsgContext(ctx, req)
+					}
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+					require.Less(t, time.Since(start), 300*time.Millisecond)
+					select {
+					case e := <-peerDone:
+						require.NoError(t, e)
+					case <-time.After(time.Second):
+						t.Fatal("failed TLS handshake did not close/join the peer socket")
+					}
+				})
+			}
+		})
+	}
+}
+
+// A submit gets one budget, not a fresh write budget after TLS establishment.
+func TestReliableSubmitBudgetIsSharedByHandshakeAndWrite(t *testing.T) {
+	for _, mode := range []string{"transaction", "legacy transport"} {
+		t.Run(mode, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			serverConfig := testServerTlsConfig(t)
+			stop := make(chan struct{})
+			peerDone := make(chan struct{})
+			defer func() { close(stop); <-peerDone }()
+			go func() {
+				defer close(peerDone)
+				raw, e := ln.Accept()
+				if e != nil {
+					return
+				}
+				defer raw.Close()
+				_ = raw.(*net.TCPConn).SetReadBuffer(4096)
+				// This real establishment phase consumes most of the same submit budget.
+				time.Sleep(250 * time.Millisecond)
+				conn := tls.Server(raw, serverConfig)
+				if e = conn.Handshake(); e != nil {
+					return
+				}
+				<-stop
+			}()
+			ua, err := NewUA(WithUserAgentReliableWriteTimeout(350*time.Millisecond), WithUserAgenTLSConfig(&tls.Config{InsecureSkipVerify: true}))
+			require.NoError(t, err)
+			defer ua.Close()
+			cli, err := NewClient(ua)
+			require.NoError(t, err)
+			req := buildTCPRequest(t, ln.Addr().String(), bytes.Repeat([]byte("x"), 4<<20))
+			req.SetTransport("TLS")
+			require.NoError(t, clientRequestBuildReq(cli, req))
+			start := time.Now()
+			if mode == "transaction" {
+				var tx sip.ClientTransaction
+				tx, err = cli.TransactionRequest(context.Background(), req)
+				if err == nil {
+					tx.Terminate()
+				}
+			} else {
+				err = ua.tp.WriteMsg(req)
+			}
+			require.ErrorIs(t, err, sip.ErrWriteStalled)
+			require.Less(t, time.Since(start), 500*time.Millisecond, "write replenished the establishment budget")
+		})
+	}
 }

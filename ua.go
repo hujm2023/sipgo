@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/hujm2023/sipgo/sip"
@@ -16,15 +17,18 @@ import (
 var ErrUserAgentReliableWriteTimeout = errors.New("reliable write timeout must be positive")
 
 type UserAgent struct {
-	name        string
-	hostname    string
-	dnsResolver *net.Resolver
-	tlsConfig   *tls.Config
-	parser      *sip.Parser
-	txOptions   []sip.TransactionLayerOption
-	tpOptions   []sip.TransportLayerOption
-	tp          *sip.TransportLayer
-	tx          *sip.TransactionLayer
+	cleanupMu     sync.Mutex
+	cleanupClosed bool
+	cleanups      map[*lateAnswerCleanup]struct{}
+	name          string
+	hostname      string
+	dnsResolver   *net.Resolver
+	tlsConfig     *tls.Config
+	parser        *sip.Parser
+	txOptions     []sip.TransactionLayerOption
+	tpOptions     []sip.TransportLayerOption
+	tp            *sip.TransportLayer
+	tx            *sip.TransactionLayer
 
 	// reliableWriteTimeout explicitly enables bounded TCP/TLS writes when > 0.
 	reliableWriteTimeout time.Duration
@@ -99,7 +103,8 @@ func WithUserAgentTransportLayerOptions(o ...sip.TransportLayerOption) UserAgent
 // It is opt-in and off by default, so existing callers keep the legacy
 // unbounded writes. Protocol timers (Timer A/B/D/H/J/M/L, retransmission
 // windows, transaction identity) are untouched: this only bounds how long a
-// single socket write may block. Because the protection is enforced by the
+// entire reliable submit (lookup/dial/handshake/queue/write) may block.
+// Automatic writes also retain protection enforced by the
 // connection owner, there is no per-call budget to reset and no per-transaction
 // deadline to clear.
 //
@@ -147,6 +152,7 @@ func NewUA(options ...UserAgentOption) (*UserAgent, error) {
 }
 
 func (ua *UserAgent) Close() error {
+	ua.closeCleanups()
 	// stop transaction layer
 	ua.tx.Close()
 
@@ -168,4 +174,39 @@ func (ua *UserAgent) TransportLayer() *sip.TransportLayer {
 
 func (ua *UserAgent) TransactionLayer() *sip.TransactionLayer {
 	return ua.tx
+}
+
+// trackCleanup makes handoff atomic with shutdown. Close stops and joins every
+// admitted controller before closing its transaction/transport dependencies.
+func (ua *UserAgent) trackCleanup(c *lateAnswerCleanup) bool {
+	ua.cleanupMu.Lock()
+	defer ua.cleanupMu.Unlock()
+	if ua.cleanupClosed {
+		return false
+	}
+	if ua.cleanups == nil {
+		ua.cleanups = make(map[*lateAnswerCleanup]struct{})
+	}
+	ua.cleanups[c] = struct{}{}
+	return true
+}
+func (ua *UserAgent) untrackCleanup(c *lateAnswerCleanup) {
+	ua.cleanupMu.Lock()
+	delete(ua.cleanups, c)
+	ua.cleanupMu.Unlock()
+}
+func (ua *UserAgent) closeCleanups() {
+	ua.cleanupMu.Lock()
+	ua.cleanupClosed = true
+	owners := make([]*lateAnswerCleanup, 0, len(ua.cleanups))
+	for c := range ua.cleanups {
+		owners = append(owners, c)
+	}
+	ua.cleanupMu.Unlock()
+	for _, c := range owners {
+		c.stop()
+	}
+	for _, c := range owners {
+		_ = c.join()
+	}
 }

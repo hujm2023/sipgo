@@ -82,7 +82,8 @@ func WithTransportLayerReadFilter(f TransportReadFilter) TransportLayerOption {
 }
 
 // WithTransportLayerReliableWriteTimeout installs a write budget on every
-// TCP/TLS connection of this layer, outbound and inbound alike. Once a write has
+// TCP/TLS connection and caps complete reliable submissions (including DNS,
+// dial and handshake). Once a write has
 // actually started, the budget unblocks it by hard-closing that exact
 // connection; while the write is still queued, the budget only makes the queued
 // caller return without touching the connection.
@@ -403,6 +404,8 @@ func (l *TransportLayer) WriteMsgContext(ctx context.Context, msg Message) error
 }
 
 func (l *TransportLayer) writeMsgTo(ctx context.Context, msg Message, addr string, network string, bounded bool) error {
+	ctx, cancel := l.reliableSubmitContext(ctx, network)
+	defer cancel()
 	/*s
 	// Client sending request, or we are sending responses
 	To consider
@@ -449,7 +452,7 @@ func (l *TransportLayer) writeMsgTo(ctx context.Context, msg Message, addr strin
 		defer conn.TryClose()
 	}
 
-	if bounded {
+	if bounded || (l.reliableWriteTimeout > 0 && isProtectedReliable(network)) {
 		return l.writeConnMessage(ctx, conn, msg, network)
 	}
 
@@ -483,6 +486,19 @@ func isProtectedReliable(network string) bool {
 	return strings.HasPrefix(n, "tcp") || strings.HasPrefix(n, "tls")
 }
 
+// reliableSubmitContext covers connection lookup, DNS, dial, TLS handshake,
+// queueing and the actual write with one earlier deadline. Nested entry points
+// inherit that deadline; they never replenish a submit's remaining budget.
+func (l *TransportLayer) reliableSubmitContext(ctx context.Context, network string) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if l.reliableWriteTimeout > 0 && isProtectedReliable(network) {
+		return context.WithTimeout(ctx, l.reliableWriteTimeout)
+	}
+	return ctx, func() {}
+}
+
 // ClientRequestConnection is based on
 // https://www.rfc-editor.org/rfc/rfc3261#section-18.1.1
 // It is wrapper for getting and creating connection
@@ -490,6 +506,8 @@ func isProtectedReliable(network string) bool {
 // In case req destination is DNS resolved, destination will be cached or in
 // other words SetDestination will be called
 func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Request) (c Connection, err error) {
+	ctx, cancel := l.reliableSubmitContext(ctx, req.Transport())
+	defer cancel()
 	network := NetworkToLower(req.Transport())
 	transport := l.getTransport(network)
 	if transport == nil {

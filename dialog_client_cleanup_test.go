@@ -155,6 +155,7 @@ func TestLate2xxCleanupAcksEveryResponseAndByesOncePerDialog(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.Less(t, elapsed, 3*time.Second, "the cleanup must stay bounded")
 
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(acks) == 4 && len(byes) == 2 }, time.Second, time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -482,7 +483,9 @@ func TestLate2xxCleanupBoundedByCleanupBudget(t *testing.T) {
 	defer mu.Unlock()
 	require.Len(t, acks, 1)
 	require.Len(t, byes, 1, "exactly one logical BYE per dialog, even when it never completes")
-	require.True(t, tx.terminated.Load(), "the INVITE must still be released")
+	require.False(t, tx.terminated.Load(), "the UA retains the INVITE protocol window")
+	require.NoError(t, ua.Close())
+	require.True(t, tx.terminated.Load(), "UA close joins the protocol owner")
 }
 
 // TestLateAnswerCleanupNotificationNeverBlocksTheFSM proves the transaction
@@ -526,4 +529,217 @@ func TestLateAnswerCleanupNotificationNeverBlocksTheFSM(t *testing.T) {
 	// The hand-off is best effort here (there is no peer to ACK); what matters is
 	// that the notification returned and that the join is still bounded.
 	_ = cleanup.join()
+}
+
+func TestLateAnswerCleanupByeWaitsForFinal(t *testing.T) {
+	ua, err := NewUA()
+	require.NoError(t, err)
+	defer ua.Close()
+	cli, err := NewClient(ua)
+	require.NoError(t, err)
+	provisional := make(chan struct{})
+	finalGate := make(chan struct{})
+	peerDone := make(chan struct{})
+	cli.TxRequester = &siptest.ClientTxRequesterResponder{OnRequest: func(req *sip.Request, w *siptest.ClientTxResponder) {
+		if req.Method != sip.BYE {
+			return
+		}
+		defer close(peerDone)
+		w.Receive(sip.NewResponseFromRequest(req, 100, "Trying", nil))
+		close(provisional)
+		<-finalGate
+		w.Receive(sip.NewResponseFromRequest(req, 200, "OK", nil))
+	}}
+	session := newCancelTestSession(t, cli, newFakeClientTx())
+	cleanup := newLateAnswerCleanup(session, context.Background(), 500*time.Millisecond)
+	cleanup.enqueue(newLate2xxResponse(session.InviteRequest, "tag-a", "5062"))
+	<-provisional
+	cleanup.closeInput()
+	joined := make(chan error, 1)
+	go func() { joined <- cleanup.join() }()
+	select {
+	case err := <-joined:
+		t.Errorf("cleanup completed after provisional only: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(finalGate)
+	<-peerDone
+	select {
+	case err := <-joined:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not join final")
+	}
+}
+
+// Normal T1 spacing must remain covered after the business wait has returned.
+// A non-2xx final can precede a forked 2xx for the same original transaction.
+func TestLateAnswerCleanupOwnsProtocolWindowAfterReturn(t *testing.T) {
+	for _, firstFinal := range []int{200, 487} {
+		t.Run(fmt.Sprint(firstFinal), func(t *testing.T) {
+			ua, err := NewUA()
+			require.NoError(t, err)
+			defer ua.Close()
+			cli, err := NewClient(ua)
+			require.NoError(t, err)
+			var acks, byes, cancels atomic.Int64
+			ready := make(chan *siptest.ClientTxResponder, 1)
+			cli.TxRequester = &siptest.ClientTxRequesterResponder{OnRequest: func(req *sip.Request, w *siptest.ClientTxResponder) {
+				switch req.Method {
+				case sip.INVITE:
+					ready <- w
+					return
+				case sip.ACK:
+					acks.Add(1)
+					return
+				case sip.BYE:
+					byes.Add(1)
+				case sip.CANCEL:
+					cancels.Add(1)
+				}
+				w.Receive(sip.NewResponseFromRequest(req, 200, "OK", nil))
+			}}
+			dua := &DialogUA{Client: cli, ContactHDR: sip.ContactHeader{Address: sip.Uri{Host: "127.0.0.1", Port: 5060}}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			session, err := dua.Invite(ctx, sip.Uri{Host: "127.0.0.1", Port: 5062}, nil)
+			require.NoError(t, err)
+			tx := <-ready
+			seen := make(chan struct{}, 1)
+			done := make(chan error, 1)
+			go func() {
+				done <- session.WaitAnswerWithCancel(ctx, AnswerOptions{OnResponse: func(res *sip.Response) error {
+					if res.IsProvisional() {
+						seen <- struct{}{}
+					}
+					return nil
+				}}, InviteCancelPolicy{CancelTimeout: time.Second, FinalResponseTimeout: 2 * time.Second, CleanupTimeout: 100 * time.Millisecond})
+			}()
+			tx.Receive(sip.NewResponseFromRequest(session.InviteRequest, 180, "Ringing", nil))
+			<-seen
+			cancel()
+			require.Eventually(t, func() bool { return cancels.Load() == 1 }, time.Second, time.Millisecond)
+			originalInvite := session.InviteRequest.Clone()
+			late := newLate2xxResponse(originalInvite, "tag-a", "5062")
+			if firstFinal == 200 {
+				tx.Receive(late)
+			} else {
+				tx.Receive(sip.NewResponseFromRequest(session.InviteRequest, 487, "Terminated", nil))
+			}
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				t.Fatal("business wait exceeded product cleanup budget")
+			}
+			// Removing a dialog from its cache must not remove protocol ownership.
+			require.NoError(t, session.Close())
+			session.InviteRequest = nil
+			session.UA = nil
+			time.Sleep(500 * time.Millisecond)
+			tx.Receive(late.Clone())
+			tx.Receive(newLate2xxResponse(originalInvite, "tag-b", "5063"))
+			expected := int64(2)
+			if firstFinal == 200 {
+				expected = 3
+			}
+			require.Eventually(t, func() bool { return acks.Load() == expected && byes.Load() == 2 }, time.Second, time.Millisecond)
+			require.NoError(t, ua.Close())
+			beforeA, beforeB := acks.Load(), byes.Load()
+			tx.Receive(newLate2xxResponse(originalInvite, "tag-after-close", "5064"))
+			time.Sleep(10 * time.Millisecond)
+			require.Equal(t, beforeA, acks.Load())
+			require.Equal(t, beforeB, byes.Load())
+		})
+	}
+}
+
+func TestLateAnswerCleanupUAClosesAndJoinsPendingBye(t *testing.T) {
+	ua, err := NewUA()
+	require.NoError(t, err)
+	defer ua.Close()
+	cli, err := NewClient(ua)
+	require.NoError(t, err)
+	pending := make(chan struct{})
+	peerDone := make(chan struct{})
+	var byes atomic.Int64
+	cli.TxRequester = &siptest.ClientTxRequesterResponder{OnRequest: func(req *sip.Request, w *siptest.ClientTxResponder) {
+		if req.Method != sip.BYE {
+			return
+		}
+		byes.Add(1)
+		w.Receive(sip.NewResponseFromRequest(req, 100, "Trying", nil))
+		close(pending)
+		close(peerDone)
+	}}
+	tx := newFakeClientTx()
+	session := newCancelTestSession(t, cli, tx)
+	cleanup := newLateAnswerCleanup(session, context.Background(), 5*time.Second)
+	cleanup.invite = tx
+	cleanup.enqueue(newLate2xxResponse(session.InviteRequest, "tag-a", "5062"))
+	<-pending
+	<-peerDone
+	start := time.Now()
+	require.NoError(t, ua.Close())
+	require.Less(t, time.Since(start), time.Second)
+	require.True(t, tx.terminated.Load())
+	for _, view := range cleanup.dialogViews() {
+		select {
+		case <-view.done:
+		case <-time.After(time.Second):
+			t.Fatal("UA.Close left a dialog task")
+		}
+		require.ErrorIs(t, view.error(), context.Canceled)
+	}
+	// Neither an existing nor a fresh lazy owner may start after shutdown.
+	cleanup.notify(newLate2xxResponse(session.InviteRequest, "tag-b", "5063"))
+	fresh := newLateAnswerCleanup(session, context.Background(), time.Second)
+	fresh.notify(newLate2xxResponse(session.InviteRequest, "tag-c", "5064"))
+	require.NoError(t, fresh.join())
+	require.Equal(t, int64(1), byes.Load())
+}
+
+func TestLateAnswerCleanupDuplicateKeepsFixedByeDeadline(t *testing.T) {
+	ua, err := NewUA()
+	require.NoError(t, err)
+	defer ua.Close()
+	cli, err := NewClient(ua)
+	require.NoError(t, err)
+	ready := make(chan struct{})
+	var acks, byes atomic.Int64
+	cli.TxRequester = &siptest.ClientTxRequesterResponder{OnRequest: func(req *sip.Request, w *siptest.ClientTxResponder) {
+		switch req.Method {
+		case sip.ACK:
+			acks.Add(1)
+		case sip.BYE:
+			byes.Add(1)
+			w.Receive(sip.NewResponseFromRequest(req, 100, "Trying", nil))
+			close(ready)
+		}
+	}}
+	session := newCancelTestSession(t, cli, newFakeClientTx())
+	cleanup := newLateAnswerCleanup(session, context.Background(), 120*time.Millisecond)
+	late := newLate2xxResponse(session.InviteRequest, "tag-a", "5062")
+	cleanup.enqueue(late)
+	<-ready
+	views := cleanup.dialogViews()
+	require.Len(t, views, 1)
+	deadline, _ := views[0].ctx.Deadline()
+	for i := 0; i < 3; i++ {
+		time.Sleep(25 * time.Millisecond)
+		cleanup.notify(late.Clone())
+	}
+	select {
+	case <-views[0].done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("duplicate extended the BYE deadline")
+	}
+	require.ErrorIs(t, views[0].error(), context.DeadlineExceeded)
+	got, _ := views[0].ctx.Deadline()
+	require.Equal(t, deadline, got)
+	// Product cleanup ended; the separate protocol owner still ACKs retransmits.
+	cleanup.notify(late.Clone())
+	require.Eventually(t, func() bool { return acks.Load() == 5 }, time.Second, time.Millisecond)
+	require.Equal(t, int64(1), byes.Load())
+	require.ErrorIs(t, cleanup.join(), context.DeadlineExceeded)
 }

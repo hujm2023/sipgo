@@ -268,6 +268,8 @@ func TestWaitAnswerWithCancelLateSuccessEndsBeforeDeadline(t *testing.T) {
 
 	require.NotNil(t, session.InviteResponse)
 	require.True(t, session.InviteResponse.IsSuccess())
+	require.False(t, tx.terminated.Load(), "protocol owner retains late responses")
+	require.NoError(t, client.UserAgent.Close())
 	require.True(t, tx.terminated.Load())
 }
 

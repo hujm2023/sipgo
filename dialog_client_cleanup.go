@@ -16,160 +16,149 @@ import (
 // single owned worker.
 const lateCleanupQueueSize = 64
 
-// lateCleanupSettle is how long the cleanup keeps accepting retransmissions
-// after the response consumer stopped. Responses are matched by the transaction
-// layer before they reach the FSM, so a few notifications can still arrive at
-// that point; the settle window absorbs them so each of them still gets its ACK.
-// The whole cleanup stays bounded by its own budget, this only shortens it.
-const lateCleanupSettle = 50 * time.Millisecond
-
-// lateAnswerCleanup owns the protocol duties for final responses that arrive
-// after the caller explicitly stopped the initial INVITE:
-//
-//   - every late or duplicated 2xx gets its own ACK (a duplicated 2xx is only
-//     reported through the transaction retransmission notification, so that
-//     notification must be observed);
-//   - every real dialog, including one with a different To-tag, gets at most one
-//     logical BYE, with its own cleanup view;
-//   - nothing runs on the transaction FSM notification stack: the notification
-//     only hands the response to the single owned worker, and the per-dialog BYE
-//     runs as a registered task. The whole cleanup is bounded by one budget and
-//     joined before the caller is released.
+// lateAnswerCleanup is a UA-owned protocol controller. Its fixed protocol
+// lifetime is separate from each dialog's product cleanup deadline. It freezes
+// request/client identity and never accesses the caller's session after handoff.
 type lateAnswerCleanup struct {
-	session *DialogClientSession
-	base    context.Context
-	timeout time.Duration
-
-	queue chan *sip.Response
-
-	startOnce sync.Once
-	started   atomic.Bool
-	ctx       context.Context
-	stop      context.CancelFunc
-
-	inputOnce sync.Once
-	inputGone chan struct{}
-
-	workerWG sync.WaitGroup
-	tasksWG  sync.WaitGroup
-
-	mu    sync.Mutex
-	views map[string]*lateDialogView
-	errs  []error
+	client        *Client
+	inviteRequest *sip.Request
+	sequence      atomic.Uint32
+	base          context.Context
+	timeout       time.Duration
+	invite        sip.ClientTransaction
+	queue         chan *sip.Response
+	ctx           context.Context
+	stop          context.CancelFunc
+	inputGone     chan struct{}
+	initialDone   chan struct{}
+	initialOnce   sync.Once
+	workerWG      sync.WaitGroup
+	tasksWG       sync.WaitGroup
+	mu            sync.Mutex
+	started       bool
+	closed        bool
+	views         map[string]*lateDialogView
+	errs          []error
+	initialID     string
 }
 
-// lateDialogView is the independent cleanup view of one real dialog. Views are
-// keyed by the dialog identity of the actual response, so a response with a new
-// To-tag can never reuse or end another dialog's cleanup.
 type lateDialogView struct {
-	id string
-
-	acks atomic.Int64
-
+	id         string
+	acks       atomic.Int64
+	ctx        context.Context
+	stop       context.CancelFunc
 	mu         sync.Mutex
 	byeStarted bool
-
-	// done is closed when this dialog's cleanup task finished.
-	done     chan struct{}
-	byeError error
+	done       chan struct{}
+	byeError   error
+	initial    bool
 }
 
 func newLateAnswerCleanup(session *DialogClientSession, base context.Context, timeout time.Duration) *lateAnswerCleanup {
-	return &lateAnswerCleanup{
-		session:   session,
-		base:      base,
-		timeout:   timeout,
-		queue:     make(chan *sip.Response, lateCleanupQueueSize),
-		inputGone: make(chan struct{}),
-		views:     make(map[string]*lateDialogView),
+	c := &lateAnswerCleanup{
+		client: session.UA.Client, inviteRequest: session.InviteRequest.Clone(),
+		base: base, timeout: timeout, queue: make(chan *sip.Response, lateCleanupQueueSize),
+		inputGone: make(chan struct{}), initialDone: make(chan struct{}), views: make(map[string]*lateDialogView),
 	}
+	c.sequence.Store(max(session.lastCSeqNo.Load(), c.inviteRequest.CSeq().SeqNo))
+	return c
 }
 
-// notify is the transaction retransmission notification. It is called from the
-// FSM with the transaction lock released, and it must not perform protocol work
-// on that stack: it only hands the response to the owned worker.
-func (c *lateAnswerCleanup) notify(res *sip.Response) {
-	c.enqueue(res)
-}
+// notify only hands off protocol work, with the FSM lock released.
+func (c *lateAnswerCleanup) notify(res *sip.Response) { c.enqueue(res) }
 
-// enqueue hands one final response to the cleanup worker. The worker and the
-// cleanup budget are created on first use, so a call that never sees a final
-// response pays nothing and has nothing to join.
 func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
-	if res == nil || !res.IsSuccess() {
-		// Non-2xx finals are acknowledged by the client transaction itself.
+	if res == nil || res.IsProvisional() {
 		return
 	}
-
-	c.startOnce.Do(func() {
-		c.ctx, c.stop = context.WithTimeout(c.base, c.timeout)
-		c.started.Store(true)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if !c.started {
+		c.ctx, c.stop = context.WithTimeout(c.base, max(sip.Timer_M, sip.Timer_D))
+		if !c.client.UserAgent.trackCleanup(c) {
+			c.stop()
+			c.closed = true
+			close(c.inputGone)
+			c.mu.Unlock()
+			return
+		}
+		c.started = true
 		c.workerWG.Add(1)
 		go c.worker()
-	})
-
+	}
+	c.mu.Unlock()
+	if !res.IsSuccess() {
+		c.initialOnce.Do(func() { close(c.initialDone) })
+		return
+	}
+	// Clone on the notification stack, before another response changes FSM state.
+	res = res.Clone()
 	select {
-	case <-c.inputGone:
-		// The consumer stopped and the worker is draining its settle window. A
-		// transaction FSM notification must never block on a stopped cleanup, so
-		// only a non-blocking hand-off is attempted here.
-		select {
-		case c.queue <- res:
-		default:
-		}
 	case c.queue <- res:
+	case <-c.inputGone:
 	case <-c.ctx.Done():
 	}
 }
 
-// closeInput tells the cleanup that no further response can be delivered, so
-// the worker drains what is queued and exits.
+// closeInput forbids all future admission, including lazy worker creation.
 func (c *lateAnswerCleanup) closeInput() {
-	c.inputOnce.Do(func() { close(c.inputGone) })
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.inputGone)
+	}
+	c.mu.Unlock()
 }
 
-// join waits for the owner and its tasks to finish. It is bounded by the
-// cleanup budget: the worker exits when the input is closed or the budget
-// expires, and every BYE task observes the same budget.
+// join closes admission before waiting. The worker is the sole task creator,
+// so tasksWG.Wait cannot race a later Add or a worker starting after this join.
 func (c *lateAnswerCleanup) join() error {
-	if !c.started.Load() {
+	c.closeInput()
+	c.workerWG.Wait()
+	return c.cleanupError()
+}
+
+// completeInitial waits only for the first dialog's bounded ACK/BYE duties.
+// The UA already owns the remaining protocol window, including new forks.
+func (c *lateAnswerCleanup) completeInitial() error {
+	c.mu.Lock()
+	started := c.started
+	c.mu.Unlock()
+	if !started {
 		return nil
 	}
-
-	c.workerWG.Wait()
-	c.tasksWG.Wait()
-	c.stop()
-
+	select {
+	case <-c.initialDone:
+	case <-c.ctx.Done():
+	}
 	return c.cleanupError()
 }
 
 func (c *lateAnswerCleanup) worker() {
 	defer c.workerWG.Done()
-
+	defer c.client.UserAgent.untrackCleanup(c)
+	defer func() {
+		c.closeInput()
+		c.tasksWG.Wait()
+		c.stop()
+		if c.invite != nil {
+			c.invite.Terminate()
+		}
+		if err := c.cleanupError(); err != nil {
+			c.client.log.Error("late answer protocol cleanup failed", "error", err)
+		}
+	}()
 	for {
 		select {
 		case res := <-c.queue:
 			c.handle(res)
-			continue
 		case <-c.ctx.Done():
 			return
 		case <-c.inputGone:
-		}
-
-		// The consumer stopped: drain what is already queued and then keep a
-		// short settle window open for retransmissions that were matched before
-		// the transaction was released. Everything stays inside the budget.
-		c.drain()
-
-		settle := time.NewTimer(lateCleanupSettle)
-		select {
-		case res := <-c.queue:
-			settle.Stop()
-			c.handle(res)
-		case <-c.ctx.Done():
-			settle.Stop()
-			return
-		case <-settle.C:
+			c.drain()
 			return
 		}
 	}
@@ -192,8 +181,14 @@ func (c *lateAnswerCleanup) handle(res *sip.Response) {
 	// Every 2xx, including every retransmission of it, carries its own ACK.
 	// The first write failure gets exactly one extra attempt on the same dialog
 	// identity, and both stay inside the cleanup budget.
-	if err := c.sendAck(res); err != nil {
-		if retryErr := c.sendAck(res); retryErr != nil {
+	ackCtx := view.ctx
+	var cancel context.CancelFunc
+	if !created {
+		ackCtx, cancel = context.WithTimeout(c.ctx, min(c.timeout, 2*time.Second))
+		defer cancel()
+	}
+	if err := c.sendAck(ackCtx, res); err != nil {
+		if retryErr := c.sendAck(ackCtx, res); retryErr != nil {
 			c.recordError(fmt.Errorf("late 2xx ACK failed for dialog %q: %w", view.id, errors.Join(err, retryErr)))
 		}
 	}
@@ -218,16 +213,21 @@ func (c *lateAnswerCleanup) dialogView(res *sip.Response) (*lateDialogView, bool
 		return view, false
 	}
 
-	view := &lateDialogView{id: id, done: make(chan struct{})}
+	viewCtx, stop := context.WithTimeout(c.ctx, c.timeout)
+	view := &lateDialogView{id: id, ctx: viewCtx, stop: stop, done: make(chan struct{})}
+	if c.initialID == "" {
+		c.initialID = id
+		view.initial = true
+	}
 	c.views[id] = view
 	return view, true
 }
 
-func (c *lateAnswerCleanup) sendAck(res *sip.Response) error {
-	ack := newAckRequestUAC(c.session.InviteRequest, res, nil)
+func (c *lateAnswerCleanup) sendAck(ctx context.Context, res *sip.Response) error {
+	ack := newAckRequestUAC(c.inviteRequest, res, nil)
 	applyDialogRouteSet(ack, res)
 
-	if err := c.session.UA.Client.WriteRequestContext(c.ctx, ack); err != nil {
+	if err := c.client.WriteRequestContext(ctx, ack); err != nil {
 		return err
 	}
 
@@ -250,7 +250,7 @@ func (c *lateAnswerCleanup) viewOf(res *sip.Response) (*lateDialogView, bool) {
 }
 
 // startByeTask registers exactly one logical BYE per dialog. The task is owned
-// by the controller (tracked in tasksWG) and joined before the caller returns.
+// by the controller (tracked in tasksWG), then joined by its UA at shutdown.
 func (c *lateAnswerCleanup) startByeTask(view *lateDialogView, res *sip.Response) {
 	view.mu.Lock()
 	if view.byeStarted {
@@ -265,22 +265,28 @@ func (c *lateAnswerCleanup) startByeTask(view *lateDialogView, res *sip.Response
 }
 
 func (c *lateAnswerCleanup) runBye(view *lateDialogView, res *sip.Response) {
-	defer c.tasksWG.Done()
-	defer close(view.done)
+	defer func() {
+		view.stop()
+		close(view.done)
+		c.tasksWG.Done()
+		if view.initial {
+			c.initialOnce.Do(func() { close(c.initialDone) })
+		}
+	}()
 
-	bye := newByeRequestUAC(c.session.InviteRequest, res, nil)
+	bye := newByeRequestUAC(c.inviteRequest, res, nil)
 	bye.SetBody(nil)
 
 	// A BYE inside the dialog needs a higher CSeq than the INVITE. The counter is
-	// shared by the dialog session so concurrent dialog views never reuse it.
+	// private to the protocol controller so it never mutates the released session.
 	if cseq := bye.CSeq(); cseq != nil {
-		cseq.SeqNo = c.session.lastCSeqNo.Add(1)
+		cseq.SeqNo = c.sequence.Add(1)
 		cseq.MethodName = sip.BYE
 	}
 
 	applyDialogRouteSet(bye, res)
 
-	tx, err := c.session.UA.Client.TransactionRequest(c.ctx, bye, c.session.requestValidate)
+	tx, err := c.client.TransactionRequest(view.ctx, bye, cleanupRequestValidate)
 	if err != nil {
 		err = fmt.Errorf("late 2xx BYE submit failed for dialog %q: %w", view.id, err)
 		view.setByeError(err)
@@ -291,14 +297,31 @@ func (c *lateAnswerCleanup) runBye(view *lateDialogView, res *sip.Response) {
 
 	// The BYE keeps its own bounded retransmission window: the transaction stays
 	// alive until its final response or the cleanup budget expires.
-	select {
-	case <-tx.Responses():
-	case <-tx.Done():
-	case <-c.ctx.Done():
-		err := fmt.Errorf("late 2xx BYE did not complete for dialog %q: %w", view.id, c.ctx.Err())
-		view.setByeError(err)
-		c.recordError(err)
+	for {
+		select {
+		case response := <-tx.Responses():
+			if response.IsProvisional() {
+				continue
+			}
+			if !response.IsSuccess() {
+				err := fmt.Errorf("late 2xx BYE failed for dialog %q: %s", view.id, response.Short())
+				view.setByeError(err)
+				c.recordError(err)
+			}
+			return
+		case <-tx.Done():
+			err := fmt.Errorf("late 2xx BYE not confirmed for dialog %q: %w", view.id, errors.Join(sip.ErrTransactionTerminated, tx.Err()))
+			view.setByeError(err)
+			c.recordError(err)
+			return
+		case <-view.ctx.Done():
+			err := fmt.Errorf("late 2xx BYE did not complete for dialog %q: %w", view.id, view.ctx.Err())
+			view.setByeError(err)
+			c.recordError(err)
+			return
+		}
 	}
+
 }
 
 func (v *lateDialogView) setByeError(err error) {
@@ -364,4 +387,14 @@ func applyDialogRouteSet(req *sip.Request, res *sip.Response) {
 	if rh := req.Route(); rh != nil && !rh.Address.UriParams.Has("lr") {
 		req.Recipient = rh.Address
 	}
+}
+
+func cleanupRequestValidate(client *Client, req *sip.Request) error {
+	if req.Via() == nil {
+		ClientRequestAddVia(client, req)
+	}
+	if req.Body() == nil {
+		req.SetBody(nil)
+	}
+	return nil
 }
