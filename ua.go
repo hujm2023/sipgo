@@ -151,6 +151,9 @@ func NewUA(options ...UserAgentOption) (*UserAgent, error) {
 	return ua, nil
 }
 
+// Close stops admission, cancels and joins owned cleanup, then closes the
+// transaction and transport layers. It does not guarantee ACK delivery for a
+// late 2xx racing shutdown; rejected cleanup admission is logged by its owner.
 func (ua *UserAgent) Close() error {
 	ua.closeCleanups()
 	// stop transaction layer

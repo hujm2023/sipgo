@@ -63,10 +63,12 @@ func (p InviteCancelPolicy) validate() error {
 // The caller states "do not continue this call". The library then:
 //   - keeps consuming the original INVITE under a fixed final-response deadline
 //     that repeated 1xx responses can not extend;
-//   - creates at most one CANCEL, only after a provisional and before any final
-//     response, with its own transaction, consumer and deadline;
-//   - joins both consumers and initial dialog cleanup, then hands the remaining
-//     fixed protocol window to its UA owner (joined by UserAgent.Close).
+//   - creates at most one CANCEL after a provisional while no final response
+//     has been observed, with its own transaction, consumer and deadline;
+//   - joins both consumers and, if the first final is a 2xx, that dialog's
+//     product cleanup. After a non-2xx final (including 487), all later forked
+//     2xx cleanup belongs to the UA, not to this wait. Remaining protocol work
+//     is joined by UserAgent.Close.
 //
 // Normal answers are unchanged: the same states, `ErrDialogResponse` for a
 // non-2xx and the same observer callback. On cancellation the returned error
@@ -74,6 +76,12 @@ func (p InviteCancelPolicy) validate() error {
 // joined with any CANCEL/initial-cleanup error. Later protocol failures remain
 // owned and logged by the UA. `Close` keeps meaning local cleanup
 // only and never sends BYE or CANCEL.
+//
+// A final response can race CANCEL submission. A CANCEL 481 is not reported as
+// a cancellation failure when the original INVITE also reached a final response
+// during this teardown; without that evidence it remains an error. UA shutdown
+// stops protocol admission: late 2xx rejected during Close are logged, but ACK
+// delivery after shutdown begins is not guaranteed.
 func (s *DialogClientSession) WaitAnswerWithCancel(ctx context.Context, answer AnswerOptions, policy InviteCancelPolicy) error {
 	if err := policy.validate(); err != nil {
 		return err
@@ -89,8 +97,8 @@ func (s *DialogClientSession) WaitAnswerWithCancel(ctx context.Context, answer A
 //
 // It runs exactly two consumers - one for the CANCEL it creates and one for the
 // original INVITE - under independent deadlines, joins both and only then
-// returns. Initial product cleanup is joined; subsequent protocol work has
-// the explicit UA owner, which is joined during UA shutdown.
+// returns. Product cleanup for a successful first final is joined; after a
+// non-2xx first final, later forks belong entirely to the UA protocol owner.
 type inviteTeardown struct {
 	session *DialogClientSession
 	policy  InviteCancelPolicy
@@ -174,11 +182,21 @@ func (t *inviteTeardown) run(ctx context.Context) error {
 	// final response or the deadline fixed when the teardown started.
 	t.wg.Wait()
 
+	var cancelResponseErr *inviteCancelResponseError
+	if errors.As(cancelErr, &cancelResponseErr) && cancelResponseErr.status == sip.StatusCallTransactionDoesNotExists && t.lastFinalResponse() != nil {
+		// CANCEL and INVITE complete independently (RFC 3261 9.1/9.2). A
+		// missing target after the original reached a final is an expected race,
+		// not a failed teardown. Never hide 481 when the INVITE stayed pending.
+		t.log().Debug("cancel target already completed", "cancel_status", cancelResponseErr.status)
+		cancelErr = nil
+	}
+
 	if res := t.lastFinalResponse(); res != nil {
 		t.session.InviteResponse = res
 	}
 
-	// Join the initial dialog's product cleanup. The registered UA owner keeps
+	// Join product cleanup only when the first final created a dialog. A non-2xx
+	// first final completes this wait; any subsequent fork is UA-owned. The UA keeps
 	// the INVITE through its separate fixed protocol window; returning here does
 	// not unregister retransmissions or let a new fork escape ACK/BYE duties.
 	cleanupErr := t.cleanup.completeInitial()
@@ -209,7 +227,8 @@ func (t *inviteTeardown) cancelInvite() error {
 	}
 
 	if !t.cancelStillValid() {
-		// RFC 3261 9.1: a CANCEL is only valid before a final response.
+		// RFC 3261 9.1: do not submit after an observed final. The independent
+		// final consumer may still race the subsequent submission.
 		return nil
 	}
 
@@ -230,9 +249,17 @@ func (t *inviteTeardown) cancelInvite() error {
 		return fmt.Errorf("cancel request failed: %w", err)
 	}
 	if res.StatusCode != sip.StatusOK {
-		return fmt.Errorf("cancel failed with non 200. code=%d", res.StatusCode)
+		return &inviteCancelResponseError{status: res.StatusCode}
 	}
 	return nil
+}
+
+type inviteCancelResponseError struct {
+	status int
+}
+
+func (e *inviteCancelResponseError) Error() string {
+	return fmt.Sprintf("cancel failed with non 200. code=%d", e.status)
 }
 
 // awaitProvisional waits, bounded by the CANCEL budget, until the original
@@ -273,9 +300,8 @@ func (t *inviteTeardown) consumeInvite() {
 		case res := <-t.invite.Responses():
 			t.observe(res)
 			if !res.IsProvisional() {
-				// A final response ends the consumption; the remaining protocol
-				// duties run under the cleanup budget before this teardown
-				// returns.
+				// A final ends this consumer. run joins product cleanup if it
+				// created a dialog; subsequent forks remain with the UA owner.
 				return
 			}
 		case <-t.invite.Done():

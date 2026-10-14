@@ -34,6 +34,7 @@ type lateAnswerCleanup struct {
 	inputGone        chan struct{}
 	initialDone      chan struct{}
 	initialOnce      sync.Once
+	rejectedOnce     sync.Once
 	workerWG         sync.WaitGroup
 	tasksWG          sync.WaitGroup
 	mu               sync.Mutex
@@ -79,6 +80,7 @@ func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		c.logStoppedAdmission(res, "owner closed")
 		return
 	}
 	if !c.started {
@@ -89,6 +91,7 @@ func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
 			c.closed = true
 			close(c.inputGone)
 			c.mu.Unlock()
+			c.logStoppedAdmission(res, "user agent closing")
 			return
 		}
 		c.started = true
@@ -105,6 +108,8 @@ func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
 	}
 	c.mu.Unlock()
 	if !res.IsSuccess() {
+		// The first final created no dialog, hence no product cleanup to join.
+		// Subsequent forked 2xx remain UA-owned and do not reopen this wait.
 		c.initialOnce.Do(func() { close(c.initialDone) })
 		return
 	}
@@ -112,9 +117,30 @@ func (c *lateAnswerCleanup) enqueue(res *sip.Response) {
 	res = res.Clone()
 	select {
 	case c.queue <- res:
+		// Shutdown can win after the admission check. Its worker may stop
+		// before dequeuing this response; ACK delivery is not guaranteed.
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed || c.ctx.Err() != nil {
+			c.logStoppedAdmission(res, "shutdown raced queue admission")
+		}
 	case <-c.inputGone:
+		c.logStoppedAdmission(res, "owner closed")
 	case <-c.ctx.Done():
+		c.logStoppedAdmission(res, "user agent closing")
 	}
+}
+
+// Close cancels protocol work before closing dependencies. Report a 2xx racing
+// that fence once per owner, without logging SIP payloads or starting new work.
+func (c *lateAnswerCleanup) logStoppedAdmission(res *sip.Response, reason string) {
+	if !res.IsSuccess() {
+		return
+	}
+	c.rejectedOnce.Do(func() {
+		c.client.log.Warn("late answer cleanup admission stopped", "reason", reason, "status", res.StatusCode)
+	})
 }
 
 // closeInput forbids all future admission, including lazy worker creation.
@@ -135,8 +161,9 @@ func (c *lateAnswerCleanup) join() error {
 	return c.cleanupError()
 }
 
-// completeInitial waits only for the first dialog's bounded ACK/BYE duties.
-// The UA already owns the remaining protocol window, including new forks.
+// completeInitial joins bounded ACK/BYE duties if the first final was a 2xx.
+// A non-2xx first final completes it immediately; all subsequent forks belong
+// to the UA even if they arrive before this method returns.
 func (c *lateAnswerCleanup) completeInitial() error {
 	c.mu.Lock()
 	started := c.started
@@ -156,6 +183,11 @@ func (c *lateAnswerCleanup) worker() {
 	defer c.client.UserAgent.untrackCleanup(c)
 	defer func() {
 		c.closeInput()
+		// Surface admitted responses that shutdown left queued. Tasks that
+		// already started retain their existing completion and error reporting.
+		for len(c.queue) > 0 {
+			c.logStoppedAdmission(<-c.queue, "owner stopped before queued response")
+		}
 		c.tasksWG.Wait()
 		c.mu.Lock()
 		for _, view := range c.views {
