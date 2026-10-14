@@ -50,7 +50,7 @@ func (t *TransportWSS) CreateConnection(ctx context.Context, laddr Addr, raddr A
 		return nil, fmt.Errorf("remote address IP not resolved")
 	}
 
-	conn, err := t.pool.addSingleflight(laddr, raddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflight(ctx, raddr, laddr, t.connectionReuse, func() (Connection, error) {
 		// We need to distict IPAddr vs address with hostname
 		// Hostname must be passed for TLS if provided due to certificates check
 		hostname := raddr.Hostname

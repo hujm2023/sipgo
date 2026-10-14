@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,12 +80,15 @@ var (
 	ErrTransactionTerminated = errors.New("transaction terminated")
 )
 
+// wrapTransportError classifies err as a transport error while keeping the
+// underlying cause in the chain (for example ErrWriteStalled from a bounded
+// connection write). The rendered message is unchanged.
 func wrapTransportError(err error) error {
-	return fmt.Errorf("%s. %w", err.Error(), ErrTransactionTransport)
+	return fmt.Errorf("%w. %w", err, ErrTransactionTransport)
 }
 
 func wrapTimeoutError(err error) error {
-	return fmt.Errorf("%s. %w", err.Error(), ErrTransactionTimeout)
+	return fmt.Errorf("%w. %w", err, ErrTransactionTimeout)
 }
 
 type Transaction interface {
@@ -171,6 +175,48 @@ type baseTx struct {
 
 	log         *slog.Logger
 	onTerminate FnTxTerminate
+
+	// spinWriteCtx carries the write context of the FSM spin currently
+	// executing. It is set right before the spin and cleared right after, so it
+	// never leaks into later automatic retransmissions.
+	spinWriteCtx atomic.Pointer[ctxBox]
+}
+
+// ctxBox wraps a context so it can be stored in an atomic.Pointer with one
+// concrete type.
+type ctxBox struct {
+	ctx context.Context
+}
+
+func (tx *baseTx) setSpinWriteCtx(ctx context.Context) {
+	if ctx == nil {
+		tx.spinWriteCtx.Store(nil)
+		return
+	}
+	tx.spinWriteCtx.Store(&ctxBox{ctx: ctx})
+}
+
+// currentSpinWriteCtx returns the write context of the running FSM spin, or nil
+// when the current write is not explicitly bounded by a caller.
+func (tx *baseTx) currentSpinWriteCtx() context.Context {
+	if b := tx.spinWriteCtx.Load(); b != nil {
+		return b.ctx
+	}
+	return nil
+}
+
+// writeMsgOnConn writes msg on the transaction connection. With a context the
+// write is bounded by it; without one the legacy connection write applies,
+// which still honors the connection-level reliable write budget (that is the
+// path used by automatic ACK/retransmission writes).
+func (tx *baseTx) writeMsgOnConn(ctx context.Context, msg Message) error {
+	if ctx == nil {
+		return tx.conn.WriteMsg(msg)
+	}
+	if cw, ok := tx.conn.(ContextWriter); ok {
+		return cw.WriteMsgContext(ctx, msg)
+	}
+	return tx.conn.WriteMsg(msg)
 }
 
 func (tx *baseTx) String() string {
@@ -248,20 +294,30 @@ func (tx *baseTx) spinFsmUnsafe(in fsmInput) {
 // Choose the right FSM init function depending on request method.
 func (tx *baseTx) spinFsm(in fsmInput) {
 	tx.fsmMu.Lock()
+	tx.setSpinWriteCtx(nil)
 	tx.spinFsmUnsafe(in)
 	tx.fsmMu.Unlock()
 }
 
 func (tx *baseTx) spinFsmWithResponse(in fsmInput, resp *Response) {
+	tx.spinFsmWithResponseCtx(in, resp, nil)
+}
+
+// spinFsmWithResponseCtx runs one FSM spin with an explicit write context. The
+// context is only visible to writes performed by this spin.
+func (tx *baseTx) spinFsmWithResponseCtx(in fsmInput, resp *Response, ctx context.Context) {
 	tx.fsmMu.Lock()
 	tx.fsmResp = resp
+	tx.setSpinWriteCtx(ctx)
 	tx.spinFsmUnsafe(in)
+	tx.setSpinWriteCtx(nil)
 	tx.fsmMu.Unlock()
 }
 
 func (tx *baseTx) spinFsmWithRequest(in fsmInput, req *Request) {
 	// TODO do we really need handling ACK and Cancel seperate
 	tx.fsmMu.Lock()
+	tx.setSpinWriteCtx(nil)
 	switch {
 	case req.IsAck(): // ACK for non-2xx response
 		tx.fsmAck = req
@@ -274,6 +330,7 @@ func (tx *baseTx) spinFsmWithRequest(in fsmInput, req *Request) {
 
 func (tx *baseTx) spinFsmWithError(in fsmInput, err error) {
 	tx.fsmMu.Lock()
+	tx.setSpinWriteCtx(nil)
 	tx.fsmErr = err
 	tx.spinFsmUnsafe(in)
 	tx.fsmMu.Unlock()

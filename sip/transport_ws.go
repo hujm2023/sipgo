@@ -267,7 +267,7 @@ func (t *TransportWS) GetConnection(addr string) Connection {
 }
 
 func (t *TransportWS) CreateConnection(ctx context.Context, laddr Addr, raddr Addr, handler MessageHandler) (Connection, error) {
-	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, func() (Connection, error) {
+	conn, err := t.pool.addSingleflight(ctx, raddr, laddr, t.connectionReuse, func() (Connection, error) {
 		var tladdr *net.TCPAddr = nil
 		if laddr.IP != nil {
 			tladdr = &net.TCPAddr{

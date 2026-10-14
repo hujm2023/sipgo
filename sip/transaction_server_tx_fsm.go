@@ -333,7 +333,7 @@ func (tx *ServerTx) passResp() error {
 		return nil
 	}
 
-	err := tx.conn.WriteMsg(lastResp)
+	err := tx.writeMsgOnConn(tx.currentSpinWriteCtx(), lastResp)
 	if err != nil {
 		tx.log.Debug("fail to pass response", "error", err, "res", lastResp.StartLine(), "tx", tx.Key())
 		tx.fsmErr = wrapTransportError(err)

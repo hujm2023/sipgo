@@ -82,6 +82,14 @@ func (s *DialogClientSession) WriteRequest(req *sip.Request) error {
 	return s.UA.Client.WriteRequest(req, s.requestValidate)
 }
 
+// WriteRequestContext is WriteRequest with a caller context. It is the in-dialog
+// entry point for ACK/BYE and any other subsequent request that must respect a
+// real write budget; on TCP/TLS the write honors ctx.
+func (s *DialogClientSession) WriteRequestContext(ctx context.Context, req *sip.Request) error {
+	s.buildReq(req)
+	return s.UA.Client.WriteRequestContext(ctx, req, s.requestValidate)
+}
+
 func (s *DialogClientSession) requestValidate(c *Client, req *sip.Request) error {
 	if req.Via() == nil {
 		ClientRequestAddVia(c, req)
@@ -238,7 +246,22 @@ var (
 // Returns errors:
 // - ErrDialogResponse in case non 2xx response
 // - any internal in case waiting answer failed for different reasons
+//
+// Cancellation here keeps the historical behavior and is only bounded by the
+// wait for the CANCEL result. Callers that need the explicit 5s CANCEL /
+// fixed Timer_B / 5s cleanup contract should use WaitAnswerWithCancel.
 func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions) error {
+	return s.waitAnswer(ctx, opts, func(cancelCtx context.Context, tx sip.ClientTransaction) error {
+		// Historical behavior: the INVITE transaction is released as soon as
+		// the CANCEL path returns.
+		defer tx.Terminate()
+		return s.inviteCancel(cancelCtx, tx)
+	})
+}
+
+// waitAnswer is the shared wait loop. onCancel is invoked with the current
+// transaction when ctx ends while the INVITE is still pending.
+func (s *DialogClientSession) waitAnswer(ctx context.Context, opts AnswerOptions, onCancel func(cancelCtx context.Context, tx sip.ClientTransaction) error) error {
 	tx, inviteRequest := s.inviteTx, s.InviteRequest
 	var r *sip.Response
 	var err error
@@ -253,8 +276,7 @@ func (s *DialogClientSession) WaitAnswer(ctx context.Context, opts AnswerOptions
 			// https://datatracker.ietf.org/doc/html/rfc3261#section-9.1
 			// Cancel can only be sent when provisional is received
 			// We will wait until transaction timeous out (TimerB)
-			defer tx.Terminate()
-			return s.inviteCancel(ctx, tx)
+			return onCancel(ctx, tx)
 		case <-tx.Done():
 			// tx.Err() can be empty
 			return errors.Join(fmt.Errorf("transaction terminated"), tx.Err())
@@ -381,6 +403,12 @@ func (s *DialogClientSession) inviteCancel(ctx context.Context, tx sip.ClientTra
 	// Terminated) response for the original request, as an RFC 2543-
 	// compliant UAS will not generate such a response.  If there is no
 	// final response for the original request in 64*T1 seconds
+	//
+	// The deadline is armed once, before the loop: provisional responses
+	// arriving in the meantime (possibly forever) must not re-arm it.
+	deadline := time.NewTimer(64 * sip.T1)
+	defer deadline.Stop()
+
 loop_487:
 	for {
 		select {
@@ -392,7 +420,7 @@ loop_487:
 			break loop_487
 		case <-tx.Done():
 			return tx.Err()
-		case <-time.After(64 * sip.T1):
+		case <-deadline.C:
 			break loop_487
 		}
 	}
@@ -426,7 +454,7 @@ func (s *DialogClientSession) WriteAck(ctx context.Context, ack *sip.Request) er
 		}
 	})
 
-	if err := s.WriteRequest(ack); err != nil {
+	if err := s.WriteRequestContext(ctx, ack); err != nil {
 		// Make sure we close our error
 		// s.Close()
 		return err

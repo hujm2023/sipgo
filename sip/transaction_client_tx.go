@@ -1,6 +1,7 @@
 package sip
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -16,7 +17,8 @@ type ClientTx struct {
 	timer_d      *time.Timer
 	timer_m      *time.Timer
 
-	onRetransmission FnTxResponse
+	onRetransmission      FnTxResponse
+	retainInviteResponses bool
 }
 
 func NewClientTx(key string, origin *Request, conn Connection, logger *slog.Logger) *ClientTx {
@@ -34,9 +36,21 @@ func NewClientTx(key string, origin *Request, conn Connection, logger *slog.Logg
 }
 
 func (tx *ClientTx) Init() error {
+	return tx.init(nil)
+}
+
+// InitContext is Init with a caller context: the initial request write is
+// bounded by ctx and, when the connection carries a reliable write budget, by
+// the earlier of both. The context is not retained by the transaction, so it
+// never bounds later automatic retransmissions.
+func (tx *ClientTx) InitContext(ctx context.Context) error {
+	return tx.init(ctx)
+}
+
+func (tx *ClientTx) init(ctx context.Context) error {
 	tx.initFSM()
 
-	if err := tx.conn.WriteMsg(tx.origin); err != nil {
+	if err := tx.writeMsgOnConn(ctx, tx.origin); err != nil {
 		e := fmt.Errorf("fail to write request on init req=%q: %w", tx.origin.StartLine(), err)
 		return wrapTransportError(e)
 	}
@@ -239,6 +253,10 @@ func (tx *ClientTx) delete(err error) bool {
 		tx.timer_b.Stop()
 		tx.timer_b = nil
 	}
+	if tx.timer_m != nil {
+		tx.timer_m.Stop()
+		tx.timer_m = nil
+	}
 	if tx.timer_d != nil {
 		tx.timer_d.Stop()
 		tx.timer_d = nil
@@ -253,5 +271,20 @@ func (tx *ClientTx) delete(err error) bool {
 		tx.log.Info("Closing connection returned error", "error", err, "tx", tx.Key())
 	}
 	tx.log.Debug("Client transaction destroyed", "tx", tx.Key())
+	return true
+}
+
+// RetainInviteResponses opts an explicitly canceled INVITE into a protocol
+// response owner. Reliable non-2xx finals retain fixed Timer_D; the
+// first forked 2xx transitions once to its independent Timer_M. Legacy callers
+// and all protocol timer defaults are unchanged.
+func (tx *ClientTx) RetainInviteResponses() bool {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.closed || !tx.origin.IsInvite() {
+		return false
+	}
+	tx.retainInviteResponses = true
+	tx.timer_d_time = max(tx.timer_d_time, Timer_D)
 	return true
 }

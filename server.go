@@ -300,6 +300,13 @@ func (srv *Server) WriteResponse(r *sip.Response) error {
 	return srv.tp.WriteMsg(r)
 }
 
+// WriteResponseContext is WriteResponse with a caller context. On TCP/TLS the
+// response write honors ctx (see TransportLayer.WriteMsgContext); the response
+// still goes to the connection selected by the original request lookup.
+func (srv *Server) WriteResponseContext(ctx context.Context, r *sip.Response) error {
+	return srv.tp.WriteMsgContext(ctx, r)
+}
+
 // Close server handle. UserAgent must be closed for full transaction and transport layer closing.
 func (srv *Server) Close() error {
 	return nil

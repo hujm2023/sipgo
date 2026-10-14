@@ -68,6 +68,14 @@ func (tx *ClientTx) inviteStateProcceeding(s fsmInput) fsmInput {
 func (tx *ClientTx) inviteStateCompleted(s fsmInput) fsmInput {
 	var spinfn fsmState
 	switch s {
+	case client_input_2xx:
+		tx.mu.Lock()
+		retained := tx.retainInviteResponses
+		tx.mu.Unlock()
+		if !retained {
+			return FsmInputNone
+		}
+		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actAcceptLateFork
 	case client_input_300_plus:
 		tx.fsmState, spinfn = tx.inviteStateCompleted, tx.actAckResend
 	case client_input_transport_err:
@@ -387,6 +395,19 @@ func (tx *ClientTx) actPassupDelete() fsmInput {
 	tx.fsmPassUp()
 	tx.stopTimerA()
 	return client_input_delete
+}
+
+// The first forked 2xx replaces the completed-phase Timer D with one Timer M.
+// Later accepted responses only notify the owner; they never reset this timer.
+func (tx *ClientTx) actAcceptLateFork() fsmInput {
+	tx.mu.Lock()
+	if tx.timer_d != nil {
+		tx.timer_d.Stop()
+		tx.timer_d = nil
+	}
+	tx.timer_m = time.AfterFunc(Timer_M, func() { tx.spinFsm(client_input_timer_m) })
+	tx.mu.Unlock()
+	return tx.actPassupRetransmission()
 }
 
 func (tx *ClientTx) actPassupAccept() fsmInput {

@@ -1,6 +1,7 @@
 package sip
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -102,8 +103,21 @@ func (tx *ServerTx) Receive(req *Request) error {
 }
 
 func (tx *ServerTx) Respond(res *Response) error {
+	return tx.respond(nil, res)
+}
+
+// RespondContext is Respond with a caller context. The response still goes
+// through the original server transaction FSM; ctx only bounds the write
+// performed by this call (and, when the connection carries a reliable write
+// budget, the earlier of both). It is not retained by the transaction, so later
+// automatic retransmissions are not bounded by an expired caller context.
+func (tx *ServerTx) RespondContext(ctx context.Context, res *Response) error {
+	return tx.respond(ctx, res)
+}
+
+func (tx *ServerTx) respond(ctx context.Context, res *Response) error {
 	if res.IsCancel() {
-		return tx.conn.WriteMsg(res)
+		return tx.writeMsgOnConn(ctx, res)
 	}
 
 	tx.mu.Lock()
@@ -122,7 +136,7 @@ func (tx *ServerTx) Respond(res *Response) error {
 	default:
 		input = server_input_user_300_plus
 	}
-	tx.spinFsmWithResponse(input, res)
+	tx.spinFsmWithResponseCtx(input, res, ctx)
 	// In case of termination or some error
 	return tx.Err()
 }
